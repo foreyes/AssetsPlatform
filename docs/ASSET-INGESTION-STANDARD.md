@@ -1,6 +1,6 @@
 # AssetsPlatform 资产整理与接入规范
 
-版本 1.0　2026 年 10 月 25 日
+版本 1.1　2026 年 10 月 25 日
 
 ## 1 目的与交付定义
 
@@ -15,7 +15,7 @@
 本文依据 AssetsPlatform 2026 年 10 月 25 日源码中的 `apps/reviewer/`、`docs/DATA-CONTRACT.md`、`docs/PRODUCT-MANUAL.md` 和托管参考 `reference/hosted/`。代码路径均相对于 AssetsPlatform 仓库根目录；输出工作区另行说明。
 
 - **冻结基线已有**：indexed 目录加载、自包含 GLB CPU 解析与 WebGL 预览代码、本地审阅、JSON 导入导出、项目路径及身份隔离。
-- **本次新增候选工具**：`scripts/import-directory.mjs`、`apps/reviewer/validate-workspace.mjs`。它们在本地下一版候选源码中提供本地文件夹导入与通用输出校验，尚未作为远端发行版交付，也不存在于早先冻结包。本文命令使用前必须检查文件确实存在；文件缺失时使用第 9.3 节手工整理路线和第 17 节校验脚本，不能声称冻结版本已具备该命令。只有 README 的仓库不是完整平台源码，不能从它启动此流程。
+- **仓库源码已包含的新增工具**：`scripts/import-directory.mjs`、`apps/reviewer/validate-workspace.mjs` 提供本地文件夹导入与通用输出校验，已随完整平台源码提交到 [foreyes/AssetsPlatform 的 `bbc29631` 提交](https://github.com/foreyes/AssetsPlatform/commit/bbc29631e6ebdb8273ebd9416647d5a31395b56a)，该提交的 CI 测试与构建通过；这不等于真实浏览器/GPU 验收或正式版本发行。早先冻结包不包含这两个工具。使用本文命令前仍须检查所取得的源码是否含有这些文件；文件缺失时使用第 9.3 节手工整理路线和第 17 节校验脚本，不得把新工具能力归于早先冻结包。
 - **不在本规范承诺内**：任意原始工程自动恢复、原游戏执行、Unity Shader 忠实移植、动画一键恢复、GPU 像素一致性、任意新项目直接接入托管后台。
 
 “必须”是交付门槛；“建议”是默认做法；“示例”不代表项目事实。未执行的检查写为“未验证”，不得写为“通过”。
