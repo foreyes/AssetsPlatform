@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "objects": [
+    {
+      "id": "object-demo-a",
+      "name": "示例立方体",
+      "category": "demo",
+      "modelUrl": "assets/cube.glb",
+      "assetId": "mesh-demo-a",
+      "assemblyStatus": "示例模型",
+      "description": "自制立方体，用于通用预览与目录切换。"
+    }
+  ]
+}

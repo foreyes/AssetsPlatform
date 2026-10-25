@@ -1,0 +1,14 @@
+{
+  "name": "asset-review-portable-candidate",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node verify.mjs && node --test tests/*.test.mjs && python3 tests/server-boundaries.test.py"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

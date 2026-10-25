@@ -1,0 +1,18 @@
+{
+  "schema": "asset-review-project-directory/1",
+  "defaultProject": "demo-a",
+  "projects": [
+    {
+      "id": "demo-a",
+      "label": "示例目录 A",
+      "config": "demo-a/project-config.json",
+      "assetRoot": "./"
+    },
+    {
+      "id": "demo-b",
+      "label": "示例目录 B",
+      "config": "demo-b/project-config.json",
+      "assetRoot": "./"
+    }
+  ]
+}

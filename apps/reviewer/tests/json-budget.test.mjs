@@ -1,0 +1,13 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {gzipSync} from 'node:zlib';
+import {createJSONBudget,readBoundedJSON} from '../shared/json-budget.mjs';
+import {readAssetShards} from '../adapters/indexed-data.mjs';
+test('plain JSON and gzip are parsed within shared aggregate budget',async()=>{const budget=createJSONBudget();assert.deepEqual(await readBoundedJSON(new Response('{"ok":true}'),{budget}),{ok:true});assert.deepEqual(await readBoundedJSON(new Response(gzipSync('{"ok":true}')),{budget,gzip:true}),{ok:true});assert.equal(budget.decoded,22)});
+test('stream without content length stops and cancels on per-response budget',async()=>{let cancelled=false;const stream=new ReadableStream({pull(c){c.enqueue(new Uint8Array(20))},cancel(){cancelled=true}});await assert.rejects(readBoundedJSON(new Response(stream),{budget:createJSONBudget({jsonLimits:{downloadBytes:30}})}),/budget exceeded/);assert.equal(cancelled,true)});
+test('gzip inflation cannot bypass decoded byte budget',async()=>{const bytes=gzipSync(JSON.stringify('x'.repeat(100000)));assert(bytes.length<500);await assert.rejects(readBoundedJSON(new Response(bytes),{budget:createJSONBudget({jsonLimits:{decodedBytes:1024}}),gzip:true}),/decoded byte budget exceeded/)});
+test('aggregate budget charges separate individually valid documents',async()=>{const budget=createJSONBudget({jsonLimits:{totalDecodedBytes:15}});await readBoundedJSON(new Response('{"ok":true}'),{budget});await assert.rejects(readBoundedJSON(new Response('{"ok":true}'),{budget}),/decoded byte budget exceeded/)});
+test('claimed oversize content length is rejected before reading',async()=>{await assert.rejects(readBoundedJSON(new Response('{}',{headers:{'content-length':'1000'}}),{budget:createJSONBudget({jsonLimits:{downloadBytes:100}})}),/budget exceeded/)});
+test('configured limits cannot exceed hard safety ceilings',()=>{const budget=createJSONBudget({jsonLimits:{downloadBytes:Infinity,decodedBytes:2**40,totalDownloadBytes:2**40}});assert.equal(budget.downloadLimit,64*1024*1024);assert.equal(budget.decodedLimit,256*1024*1024);assert.equal(budget.totalDownloadLimit,1024*1024*1024)});
+test('shard explosion rejected before any fetch',async()=>{let reads=0;await assert.rejects(readAssetShards(Array(257).fill('a'),async()=>{reads++;return []}),/shard count/);assert.equal(reads,0)});
+test('shard concurrency is bounded and output ordering deterministic',async()=>{let active=0,peak=0;const output=await readAssetShards(Array.from({length:17},(_,i)=>i),async i=>{active++;peak=Math.max(peak,active);await new Promise(r=>setTimeout(r,2));active--;return [i]},{concurrency:3});assert.equal(peak,3);assert.deepEqual(output,Array.from({length:17},(_,i)=>i))});

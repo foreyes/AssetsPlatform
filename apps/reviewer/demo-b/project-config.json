@@ -1,0 +1,54 @@
+{
+  "id": "demo-b",
+  "datasetId": "example-v1",
+  "assetRoot": "./",
+  "dataKind": "indexed",
+  "renderer": {
+    "kind": "three",
+    "module": "viewer.mjs",
+    "compare": true
+  },
+  "config": {
+    "slug": "demo-b",
+    "label": "示例目录 B",
+    "reviewKey": "demo-b:reviews",
+    "renderPreferenceKey": "demo-b:profile",
+    "importFormat": "asset-review-demo",
+    "exportPrefix": "AssetReview",
+    "defaultProfile": "material",
+    "compareProfile": "toon",
+    "verifiedAnimation": false,
+    "importLimitMiB": 25,
+    "sharedSelections": false,
+    "capabilities": {
+      "animationFilters": false,
+      "research": false,
+      "effects": false,
+      "weaponSpotlight": false,
+      "sourceEvidenceOnlyProfiles": false
+    },
+    "auditSections": [
+      {
+        "title": "示例资产",
+        "text": "这是自制立方体，用于验证目录、渲染方式、选择和审阅记录。不是游戏素材。"
+      }
+    ]
+  },
+  "typeLabels": {
+    "mesh": "模型",
+    "object": "物件"
+  },
+  "categoryLabels": {
+    "demo": "示例"
+  },
+  "defaultProfiles": [
+    {
+      "id": "material",
+      "label": "源材质",
+      "mode": "material",
+      "implemented": true,
+      "description": "使用 GLB 中的材质颜色和贴图。",
+      "parameters": {}
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+import { env } from 'cloudflare:workers';
+import { getChatGPTUser } from '@/app/chatgpt-auth';
+import { createPilotMCP } from '@/lib/asset-pilot-mcp.mjs';
+import { createIncrementalStorage } from '@/incremental-candidate/storage.mjs';
+import { createBatch877Storage } from '@/lib/batch877-storage.mjs';
+import plan from '@/lib/generated/batch877-r2-plan.json';
+import release from '@/lib/generated/asset-pilot.json';
+export const dynamic = 'force-dynamic';
+const handle = createPilotMCP({ release, getUser: getChatGPTUser, batchStorage:createBatch877Storage({plan}), incrementalStorage:createIncrementalStorage() });
+export const POST = (request: Request) => handle(request, env);

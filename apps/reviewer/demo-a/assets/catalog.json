@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "id": "mesh-demo-a",
+      "name": "立方体模型",
+      "type": "mesh",
+      "category": "demo",
+      "modelUrl": "assets/cube.glb"
+    }
+  ]
+}
