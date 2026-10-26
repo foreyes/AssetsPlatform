@@ -1,0 +1,26 @@
+{
+  "id": "animation-example",
+  "datasetId": "self-authored-linear-1",
+  "assetRoot": "./",
+  "dataKind": "indexed",
+  "renderer": { "kind": "three", "module": "viewer.mjs", "compare": true },
+  "config": {
+    "slug": "animation-example",
+    "label": "自制动画接入练习（待 WebGL 复验）",
+    "reviewKey": "animation-example:reviews",
+    "renderPreferenceKey": "animation-example:profile",
+    "importFormat": "asset-review-animation-example",
+    "exportPrefix": "AnimationExample",
+    "defaultProfile": "material",
+    "compareProfile": "toon",
+    "verifiedAnimation": true,
+    "animationCatalogUrl": "assets/animation-catalog.json",
+    "actionsCatalogUrl": "assets/actions-catalog.json",
+    "importLimitMiB": 25,
+    "sharedSelections": false,
+    "auditSections": [{ "title": "动画证据边界", "text": "自制 1 秒刚性节点动画，仅供接入练习。目录记录尚待真实 WebGL 复验，因此不显示播放按钮；不得把布尔字段当作已发生的验证。" }]
+  },
+  "typeLabels": { "mesh": "模型", "object": "物件" },
+  "categoryLabels": { "synthetic": "自制合成示例" },
+  "defaultProfiles": [{ "id": "material", "label": "源材质", "mode": "material", "implemented": true, "description": "GLB 中的纯色材质。", "parameters": {} }]
+}

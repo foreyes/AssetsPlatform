@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -24,7 +25,7 @@ test('public build is deterministic, allowlisted and explicitly backend-free',()
 });
 
 test('isolated build refuses symlink inputs and outputs, and never copies unlisted data',()=>{
- const sandbox=fs.mkdtempSync('/tmp/public-build-test-');
+ const sandbox=fs.mkdtempSync(path.join(os.tmpdir(), 'public-build-test-'));
  try {
   fs.mkdirSync(path.join(sandbox,'scripts'));
   fs.mkdirSync(path.join(sandbox,'apps/reviewer'),{recursive:true});
@@ -45,4 +46,22 @@ test('isolated build refuses symlink inputs and outputs, and never copies unlist
   assert.notEqual(run().status,0);
   assert(!fs.existsSync(path.join(sandbox,'missing')));
  } finally {fs.rmSync(sandbox,{recursive:true,force:true});}
+});
+
+test('every public project config, declared catalogue and animation example harness is in the built artifact',()=>{
+ build();const built=path.join(root,'dist/reviewer');
+ const directory=JSON.parse(fs.readFileSync(path.join(built,'project-directory.json')));
+ for(const entry of directory.projects){
+  const configPath=path.join(built,entry.config), config=JSON.parse(fs.readFileSync(configPath));
+  const base=path.dirname(configPath),settings=config.config;
+  const declared=['assets/catalog.json','assets/objects-catalog.json','assets/render-profiles.json',...['catalogUrl','objectsCatalogUrl','animationCatalogUrl','actionsCatalogUrl','renderProfilesUrl'].map(field=>settings[field]).filter(Boolean)];
+  for(const relative of declared){
+   const target=path.resolve(base,relative);assert(fs.existsSync(target),`${entry.id}: missing ${relative}`);
+   const data=JSON.parse(fs.readFileSync(target));
+   for(const record of [...(data.assets||[]),...(data.objects||[])])for(const field of ['modelUrl','dataUrl','previewUrl','imageUrl','originalUrl'])if(record[field])assert(fs.existsSync(path.resolve(base,record[field])),`${entry.id}: missing referenced ${record[field]}`);
+  }
+ }
+ assert(fs.existsSync(path.join(built,'animation-example/validate-webgl.html')));
+ assert(fs.existsSync(path.join(built,'animation-example/assets/linear-translation.glb')));
+ assert(fs.existsSync(path.join(built,'animation-example/assets/linear-translation.animation.json')));
 });

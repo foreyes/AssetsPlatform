@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "coordinateSystem": "glTF",
+  "sourceId": "synthetic:linear-translation:object",
+  "nodes": [
+    {
+      "id": "synthetic:linear-translation:root",
+      "glbNodeIndex": 0,
+      "parentId": null,
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": "synthetic:linear-translation:mesh",
+      "glbNodeIndex": 1,
+      "parentId": "synthetic:linear-translation:root",
+      "translation": [
+        0,
+        0.25,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    }
+  ],
+  "clips": [
+    {
+      "id": "synthetic-linear-1s",
+      "name": "自制 1 秒线性平移",
+      "duration": 1,
+      "loop": false,
+      "limitations": [
+        "合成刚性节点平移；不包含蒙皮、Animator、事件、物理、IK 或 morph。"
+      ],
+      "tracks": [
+        {
+          "nodeId": "synthetic:linear-translation:mesh",
+          "path": "translation",
+          "interpolation": "LINEAR",
+          "times": [
+            0,
+            1
+          ],
+          "values": [
+            [
+              0,
+              0.25,
+              0
+            ],
+            [
+              1,
+              0.25,
+              0
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

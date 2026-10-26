@@ -1,231 +1,32 @@
-// Shared inspection presets, independent of catalogue identity.
+// Six self-authored, catalogue-independent inspection presets. They change only
+// browser lighting/material presentation; no profile reconstructs a source engine.
+const light = {
+  lightDirection: [0.4, 0.7, 0.6],
+  ambientColor: [1, 1, 1],
+  ambientStrength: 0.5,
+  keyLightColor: [1, 1, 1],
+  keyLightStrength: 0.8,
+  baseTint: [1, 1, 1],
+  saturation: 1,
+  contrast: 1
+};
+const profile = (id, label, mode, parameters, description) => ({
+  id, label, mode, parameters, implemented: true,
+  status: 'browser-inspection', description,
+  unsupportedFeatures: ['Source-engine shaders, scene lighting, and post-processing']
+});
 export const COMMON_RENDER_PROFILES = [
-  {
-    "id": "clay",
-    "label": "白模",
-    "mode": "clay",
-    "parameters": {
-      "unlit": false,
-      "lightDirection": [
-        0.4,
-        0.8,
-        1
-      ],
-      "ambientColor": [
-        1,
-        1,
-        1
-      ],
-      "ambientStrength": 0.42,
-      "keyLightColor": [
-        1,
-        0.98,
-        0.93
-      ],
-      "keyLightStrength": 0.85,
-      "shadowColor": [
-        0,
-        0,
-        0
-      ],
-      "baseTint": [
-        1,
-        1,
-        1
-      ],
-      "saturation": 1,
-      "contrast": 1,
-      "bands": 3,
-      "lightThreshold": 0.5
-    },
-    "implemented": true,
-    "status": "browser-approximation",
-    "description": "浏览器预览风格；不修改模型、贴图或原材质，不代表原游戏渲染器。",
-    "unsupportedFeatures": [
-      "原游戏自定义 Shader、场景灯光和后处理"
-    ]
-  },
-  {
-    "id": "toon",
-    "label": "三阶卡通",
-    "mode": "toon",
-    "parameters": {
-      "unlit": false,
-      "lightDirection": [
-        0.4,
-        0.8,
-        1
-      ],
-      "ambientColor": [
-        1,
-        1,
-        1
-      ],
-      "ambientStrength": 0.42,
-      "keyLightColor": [
-        1,
-        0.98,
-        0.93
-      ],
-      "keyLightStrength": 0.85,
-      "shadowColor": [
-        0.62,
-        0.67,
-        0.58
-      ],
-      "baseTint": [
-        1,
-        1,
-        1
-      ],
-      "saturation": 1,
-      "contrast": 1,
-      "bands": 3,
-      "lightThreshold": 0.45
-    },
-    "implemented": true,
-    "status": "browser-approximation",
-    "description": "浏览器预览风格；不修改模型、贴图或原材质，不代表原游戏渲染器。",
-    "unsupportedFeatures": [
-      "原游戏自定义 Shader、场景灯光和后处理"
-    ]
-  },
-  {
-    "id": "paradise_marsh",
-    "label": "自然柔光",
-    "mode": "material",
-    "parameters": {
-      "lightDirection": [
-        0.55,
-        0.8,
-        0.45
-      ],
-      "ambientColor": [
-        1,
-        1,
-        1
-      ],
-      "ambientStrength": 0.45,
-      "keyLightColor": [
-        1,
-        1,
-        1
-      ],
-      "keyLightStrength": 0.8,
-      "baseTint": [
-        1,
-        1,
-        1
-      ],
-      "saturation": 1,
-      "contrast": 1,
-      "unlit": false,
-      "shadowColor": [
-        0.07809719443321228,
-        0.1402921825647354,
-        0.4245283007621765
-      ],
-      "bands": 0,
-      "lightThreshold": 0.5
-    },
-    "implemented": true,
-    "status": "browser-approximation",
-    "description": "浏览器预览风格；不修改模型、贴图或原材质，不代表原游戏渲染器。",
-    "unsupportedFeatures": [
-      "原游戏自定义 Shader、场景灯光和后处理"
-    ]
-  },
-  {
-    "id": "cozy_island",
-    "label": "双阶冷影",
-    "mode": "toon",
-    "parameters": {
-      "unlit": false,
-      "lightDirection": [
-        0.55,
-        0.8,
-        0.45
-      ],
-      "ambientColor": [
-        1,
-        1,
-        1
-      ],
-      "ambientStrength": 0.45,
-      "keyLightColor": [
-        1,
-        1,
-        1
-      ],
-      "keyLightStrength": 0.8,
-      "baseTint": [
-        1,
-        1,
-        1
-      ],
-      "saturation": 1,
-      "contrast": 1,
-      "unlit": false,
-      "bands": 2,
-      "lightThreshold": 0.45,
-      "shadowColor": [
-        0.48730966,
-        0.61675125,
-        0.75
-      ]
-    },
-    "implemented": true,
-    "status": "browser-approximation",
-    "description": "浏览器预览风格；不修改模型、贴图或原材质，不代表原游戏渲染器。",
-    "unsupportedFeatures": [
-      "原游戏自定义 Shader、场景灯光和后处理"
-    ]
-  },
-  {
-    "id": "hamsters_away",
-    "label": "双阶暖调",
-    "mode": "toon",
-    "parameters": {
-      "unlit": false,
-      "lightDirection": [
-        0.55,
-        0.8,
-        0.45
-      ],
-      "ambientColor": [
-        1,
-        1,
-        1
-      ],
-      "ambientStrength": 0.45,
-      "keyLightColor": [
-        1,
-        1,
-        1
-      ],
-      "keyLightStrength": 0.8,
-      "baseTint": [
-        1,
-        1,
-        1
-      ],
-      "saturation": 1,
-      "contrast": 1,
-      "unlit": false,
-      "bands": 2,
-      "lightThreshold": 0.35,
-      "shadowColor": [
-        0.827451,
-        0.6154618,
-        0.5792157
-      ]
-    },
-    "implemented": true,
-    "status": "browser-approximation",
-    "description": "浏览器预览风格；不修改模型、贴图或原材质，不代表原游戏渲染器。",
-    "unsupportedFeatures": [
-      "原游戏自定义 Shader、场景灯光和后处理"
-    ]
-  }
+  profile('material', 'GLB 材质', 'material', {}, '显示受支持的 GLB 材质属性；仅为浏览器检视。'),
+  profile('clay', '中性白模', 'clay', {...light, baseTint: [1, 1, 1]}, '统一浅色表面，便于检查轮廓和几何。'),
+  profile('toon', '三阶明暗', 'toon', {...light, bands: 3, lightThreshold: 0.5, shadowColor: [0.45, 0.5, 0.55]}, '以三阶明暗检查形体可读性。'),
+  profile('neutral-soft', '柔和中性', 'material', {...light, ambientStrength: 0.6, keyLightStrength: 0.55, saturation: 0.85, contrast: 0.9}, '降低对比度以检查材质和轮廓。'),
+  profile('cool-bands', '冷调双阶', 'toon', {...light, bands: 2, lightThreshold: 0.5, shadowColor: [0.45, 0.55, 0.7], baseTint: [0.96, 0.98, 1]}, '自定义冷调双阶明暗；不代表来源风格。'),
+  profile('warm-bands', '暖调双阶', 'toon', {...light, bands: 2, lightThreshold: 0.5, shadowColor: [0.7, 0.55, 0.4], baseTint: [1, 0.98, 0.95]}, '自定义暖调双阶明暗；不代表来源风格。')
 ];
-export function commonIndexedProfiles(existing=[]){const map=new Map(existing.map(p=>[p.id,p.id==='material'?{...p,label:'源材质'}:p]));for(const p of COMMON_RENDER_PROFILES)map.set(p.id,structuredClone(p));return [...map.values()];}
+export function commonIndexedProfiles(existing = []) {
+  const map = new Map(COMMON_RENDER_PROFILES.map(p => [p.id, structuredClone(p)]));
+  for (const p of existing) {
+    if (!map.has(p.id)) map.set(p.id, p); // Explicit catalogue extras cannot redefine the core presets.
+  }
+  return [...map.values()];
+}

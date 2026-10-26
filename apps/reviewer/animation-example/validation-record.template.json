@@ -1,0 +1,24 @@
+{
+  "fixture": "animation-example",
+  "scope": "self-authored 1 second rigid LINEAR translation only",
+  "glbSha256": null,
+  "sidecarSha256": null,
+  "cpu": {
+    "command": "node --test apps/reviewer/tests/animation-example.test.mjs",
+    "result": null,
+    "runAtUtc": null
+  },
+  "webgl": {
+    "browserAndVersion": null,
+    "operatingSystem": null,
+    "gpu": null,
+    "runAtUtc": null,
+    "contextCreated": null,
+    "startMidEndVisualMatch": null,
+    "playPauseSeekStopMatch": null,
+    "evidencePaths": [],
+    "result": null
+  },
+  "limitations": ["Does not verify Animator, events, physics, IK, skin deformation, or morph targets."],
+  "reviewer": null
+}

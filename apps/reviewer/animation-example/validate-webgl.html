@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>自制动画 WebGL 人工复验（不改变目录门禁）</title>
+  <style>
+    body{font:16px system-ui,sans-serif;max-width:850px;margin:2rem auto;padding:0 1rem;color:#202634;background:#f6f8fc}
+    #stage{height:420px;position:relative;border:1px solid #a5adbd;background:#eef4ff}
+    .controls{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:1rem 0}
+    button{font:inherit;padding:.35rem .7rem}input{width:220px}
+    #status{white-space:pre-wrap}code{font-size:.9em}
+  </style>
+</head>
+<body>
+  <h1>自制动画 WebGL 人工复验</h1>
+  <p>此隔离页直接把侧车交给公开 <code>viewer.mjs</code>，用于在真实浏览器检视图像和交互；<strong>它不读取、不更改动画目录的 ready 门禁或任何验证布尔字段</strong>，也不构成自动像素证据。</p>
+  <div id="stage"></div>
+  <div class="controls">
+    <button id="play" disabled>▶ 播放</button><button id="pause" disabled>Ⅱ 暂停</button>
+    <label>定位 <input id="seek" type="range" min="0" max="1000" value="0" disabled></label>
+    <button id="stop" disabled>■ 停止</button><output id="time">0.00 s</output>
+  </div>
+  <p id="status" role="status">正在加载本地模型与侧车…</p>
+  <script type="module">
+    import { createViewer } from '../viewer.mjs';
+    const $ = id => document.getElementById(id);
+    let viewer, playing = false, frame = 0, last = null, time = 0;
+    const clipId = 'synthetic-linear-1s';
+    function pause(){ playing = false; last = null; cancelAnimationFrame(frame); frame = 0; }
+    function seek(value){ time = Math.max(0, Math.min(1, value)); viewer.setAnimationTime(clipId, time); $('seek').value = String(Math.round(time * 1000)); $('time').value = time.toFixed(2) + ' s'; }
+    function tick(now){ if(!playing)return; if(last !== null)seek(Math.min(1, time + (now-last)/1000)); last = now; if(time >= 1){pause();return;} frame = requestAnimationFrame(tick); }
+    try {
+      const response = await fetch('./assets/linear-translation.animation.json', { redirect: 'error' });
+      if(!response.ok)throw Error('侧车读取失败：HTTP ' + response.status);
+      const data = await response.json();
+      viewer = await createViewer($('stage'), './assets/linear-translation.glb', { animationData: data });
+      const clips = viewer.getAnimationClips();
+      if(clips.length !== 1 || clips[0].id !== clipId || viewer.getAnimationDiagnostics().length)throw Error('片段或绑定诊断不符：' + JSON.stringify(viewer.getAnimationDiagnostics()));
+      seek(0);
+      for(const id of ['play','pause','seek','stop'])$(id).disabled = false;
+      $('status').textContent = '片段与绑定通过浏览器解析；请人工检查起点/中点/终点图像、WebGL 上下文及所有控件，并保存证据。';
+      $('play').onclick = () => { if(time >= 1)seek(0); if(!playing){playing = true; last = null; frame = requestAnimationFrame(tick);} };
+      $('pause').onclick = pause;
+      $('seek').oninput = event => seek(Number(event.target.value)/1000);
+      $('stop').onclick = () => {pause();seek(0);};
+      window.addEventListener('pagehide', () => {pause();viewer.dispose();}, {once:true});
+    } catch(error){$('status').textContent = '验证页加载失败：' + error.message; console.error(error); viewer?.dispose();}
+  </script>
+</body>
+</html>

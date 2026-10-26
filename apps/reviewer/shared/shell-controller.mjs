@@ -7,7 +7,7 @@ export function configureShell({project,state,onFacets,onLayout,onDataset,onProj
  select.onchange=()=>{if(!directory.projects.some(p=>p.id===select.value))throw Error('Unknown registered project');onProjectLeave?.();const url=new URL(location.href);url.searchParams.set('project',select.value);location.assign(url.href)};
  // Full navigation intentionally terminates the old renderer/queue/storage realm.
  // The new descriptor receives a fresh project+dataset cache namespace.
- for(const [id,visible]of [['weapons-btn',config.capabilities.weaponSpotlight],['weapon-effects-btn',config.capabilities.effects],['research-btn',config.capabilities.research],['animation-filter',config.capabilities.animationFilters],['animation-filter-hint',config.capabilities.animationFilters],['offline-consumer-link',config.sharedSelections]]){const control=$(id);if(control)control.hidden=!visible};
+ for(const [id,visible]of [['animation-filter',config.capabilities.animationFilters],['animation-filter-hint',config.capabilities.animationFilters],['offline-consumer-link',config.sharedSelections]]){const control=$(id);if(control)control.hidden=!visible};
 
  $('default-profile-note').textContent='保留此浏览器已选模式 · '+(config.defaultProfileLabel||'按项目能力提供');
  const stats=[['可预览物件','有模型资源可供查看'],['物件总数','当前目录收录的物件'],['资源总数','模型、贴图、材质等关联资源']];

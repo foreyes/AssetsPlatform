@@ -1,4 +1,4 @@
-// Pure indexed Assets-folder adapter, used by Paradise Marsh and Sulfur.
+// Pure indexed Assets-folder adapter for registered local review catalogues.
 // No DOM, events, storage, or interaction state belongs in data adapters.
 import { getResourceResolver, mapResourceData } from '../shared/resource-url.mjs';
 export async function readAssetShards(urls, readJSON, {
@@ -49,12 +49,7 @@ export async function loadData({
     ...record,
     objectCategory: classifyCategory(record, config.categoryRules)
   }));
-  const diagnostics = config.objectDiagnosticsUrl ? await read(config.objectDiagnosticsUrl) : null;
   const evidence = await read(objectCatalog.profilesUrl || 'assets/render-profiles.json', false);
-  const materialRules = (await read('assets/canopy-rules.json', false)) || {
-    version: 1,
-    flatCanopySourceMaterialIds: []
-  };
   const animationIndex = config.verifiedAnimation ? await read(config.animationCatalogUrl, false) : null;
   const actionIndex = config.verifiedAnimation ? await read(config.actionsCatalogUrl, false) : null;
   return {
@@ -63,9 +58,7 @@ export async function loadData({
       assets
     },
     objectCatalog,
-    diagnostics,
     evidence,
-    materialRules,
     animationIndex,
     actionIndex,
     // Data-only evidence, rendered by the existing common evidence panel. No uploaded code.

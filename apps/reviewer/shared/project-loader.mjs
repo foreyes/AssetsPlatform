@@ -77,7 +77,6 @@ export async function loadProject({
       projectId: descriptor.id,
       datasetId: descriptor.datasetId || 'verified',
       assetRoot,
-      nativeModuleBase: descriptor.nativeModuleBase || '/entity/',
       dataKind: descriptor.dataKind || 'indexed',
       renderer: descriptor.renderer || {
         kind: 'three',
@@ -106,7 +105,7 @@ export function assetURL(config, path) {
 export async function loadProjectData(project, readJSON) {
   if (project.config.dataKind !== 'indexed') throw Error('Portable reviewer supports indexed data only');
   const module = await import('../adapters/indexed-data.mjs');
-  return validateCatalogData(await (module.loadData || module.loadEntityData)({
+  return validateCatalogData(await module.loadData({
     readJSON,
     config: project.config,
     baseUrl: project.config.assetRoot

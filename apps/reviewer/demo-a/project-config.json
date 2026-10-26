@@ -22,9 +22,6 @@
     "sharedSelections": false,
     "capabilities": {
       "animationFilters": false,
-      "research": false,
-      "effects": false,
-      "weaponSpotlight": false,
       "sourceEvidenceOnlyProfiles": false
     },
     "auditSections": [

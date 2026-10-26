@@ -1,3 +1,7 @@
+import { semanticViewScope } from './shared/semantic-workbench.mjs';
+import { mountSemanticUI } from './shared/semantic-ui.mjs';
+import { catalogueSummary, clearCondition } from './shared/catalogue-summary.mjs';
+import { imageObjectPreviewLabel } from './shared/preview-status.mjs';
 import { createJSONBudget, readBoundedJSON } from './shared/json-budget.mjs';
 import { importReviewBackup, canRestoreReviewSnapshot, restoreReviewSnapshot } from './shared/review-import.mjs';
 import { commonIndexedProfiles } from './shared/common-render-profiles.mjs';
@@ -13,7 +17,7 @@ import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
 import { loadReviewState, saveReviewState } from './shared/selection-state.mjs';
 import { configureShell as mountShell, renderEvidenceSections } from './shared/shell-controller.mjs';
-import { getResourceResolver, mapResourceData, createProjectScope } from './shared/resource-url.mjs';
+import { getResourceResolver, createProjectScope } from './shared/resource-url.mjs';
 const project = await guardStartup(() => loadProject());
 const {
   config,
@@ -21,13 +25,7 @@ const {
   categoryLabels,
   objectNames
 } = project;
-// Project descriptors select data and capabilities, never a project-specific landing page.
-config.capabilities = {
-  ...config.capabilities,
-  weaponSpotlight: false,
-  effects: false,
-  research: false
-};
+// Project descriptors select data, not executable project-specific integrations.
 const resourceResolver = getResourceResolver(config),
   resourceScope = createProjectScope(resourceResolver),
   jsonBudget = createJSONBudget(config);
@@ -40,6 +38,7 @@ const {
   sanitizeReviews,
   parseReviewImport,
   countByType,
+  availableProfile,
   readDefaultProfile,
   writeDefaultProfile,
   PAGE_SIZE,
@@ -59,7 +58,6 @@ const fmt = value => value === undefined || value === null ? '未提取' : Numbe
 const KEY = config.reviewKey;
 const icons = {
   mesh: '◇',
-  prefab: '⌘',
   texture: '▧',
   material: '◒',
   animation: '▷',
@@ -70,7 +68,6 @@ const icons = {
 let catalog,
   objectCatalog,
   profileSources = [],
-  diagnostics = new Map(),
   resources = [],
   objects = [],
   profiles = [...defaultProfiles],
@@ -81,11 +78,13 @@ let catalog,
 let state = {
   ...createWorkbenchState(),
   animation: 'all',
+  semantic: {},
   facets: {
     ...(config.defaultFacets || {})
   },
   layout: 'grid'
 };
+let semanticUI = null;
 let projectData,
   currentVariant = null,
   hierarchyRequest = 0,
@@ -107,87 +106,10 @@ let reviews = Object.create(null),
   profileA = config.defaultProfile,
   profileB = 'toon',
   defaultProfile = config.defaultProfile,
-  materialRules = {
-    version: 1,
-    flatCanopySourceMaterialIds: []
-  },
   commentTimer,
   toastTimer;
-let weaponEffects = null,
-  animationMode = 'constraint',
-  actionLibrary = new Map(),
-  activeActionId = null,
-  actionGroup = 'recommended';
-function actionsFor(item) {
-  return (actionLibrary.get(item?.id)?.actions || []).filter(a => a.status === 'ready');
-}
-function currentAction() {
-  return actionsFor(current).find(a => a.id === activeActionId) || null;
-}
-function actionRole(a) {
-  return a.classification === 'derived_source_state_flow' ? '指定条件完整流程' : a.classification === 'static_pose' ? '静态姿势（无运动）' : a.role || '独立源片段';
-}
-function renderActionChoices() {
-  const list = actionsFor(current),
-    select = $('#animation-clip');
-  if (!list.length) return;
-  const visible = actionGroup === 'recommended' ? list.filter(a => a.recommended) : actionGroup === 'clips' ? list.filter(a => a.classification !== 'derived_source_state_flow') : [];
-  select.innerHTML = visible.map(a => `<option value="${esc(a.id)}">${esc(a.name)} · ${formatAnimationTime(a.duration)} · ${esc(actionRole(a))}</option>`).join('');
-  select.disabled = actionGroup === 'references';
-  if (actionGroup === 'references') select.innerHTML = '<option>未转换引用不提供播放</option>';else select.value = activeActionId;
-  $('#animation-library').value = actionGroup;
-}
-async function selectAction(id, autoplay = false) {
-  const action = actionsFor(current).find(a => a.id === id);
-  if (!action) return;
-  pausePlayback();
-  activeActionId = id;
-  actionGroup = action.classification === 'derived_source_state_flow' || actionGroup === 'recommended' && action.recommended ? 'recommended' : 'clips';
-  const itemId = current?.id,
-    resumeEpoch = animationPauseEpoch,
-    pending = startViewers(true, false),
-    request = viewerRequest;
-  await pending;
-  if (request === viewerRequest && current?.id === itemId && currentAction()?.id === id && animationClips.some(c => c.id === action.clipId)) {
-    if (autoplay && action.classification !== 'static_pose' && actionGroup !== 'references' && resumeEpoch === animationPauseEpoch && !document.hidden) playback.play();
-    $('.preview-panel').focus({
-      preventScroll: true
-    });
-  }
-}
-async function changeActionGroup(group) {
-  pausePlayback();
-  actionGroup = group;
-  const list = actionsFor(current),
-    eligible = group === 'recommended' ? list.filter(a => a.recommended) : list.filter(a => a.classification !== 'derived_source_state_flow');
-  if (group === 'references') {
-    renderActionChoices();
-    updateAnimationControls(playback.getState());
-    $('#animation-status').textContent = `${relatedResources(current, 'animation').filter(r => !list.some(a => a.sourceClipId === r.sourceId)).length} 个引用尚未转换；引用列表仅查看元数据，不是播放。模型留在当前位置。`;
-    return;
-  }
-  if (!eligible.some(a => a.id === activeActionId) && eligible.length) {
-    activeActionId = eligible[0].id;
-    await startViewers(true, false);
-  } else {
-    renderActionChoices();
-    updateAnimationControls(playback.getState());
-  }
-}
 function selectedAnimationRecord(item) {
-  return resolveAnimation({
-    enabled: config.verifiedAnimation,
-    item,
-    base: animationRecords.get(item.id),
-    action: actionsFor(item).find(a => a.id === activeActionId),
-    mode: animationMode,
-    references: relatedResources(item, 'animation')
-  }).record;
-}
-async function changeAnimationMode(mode) {
-  pausePlayback();
-  animationMode = mode === 'source' ? 'source' : 'constraint';
-  await startViewers(true);
+  return resolveAnimation({enabled:config.verifiedAnimation,item,base:animationRecords.get(item.id),references:relatedResources(item,'animation')}).record;
 }
 let thumbnailObserver,
   thumbnailEpoch = 0,
@@ -199,7 +121,7 @@ const playback = createPlaybackTimeline({
   onFrame: applyAnimationFrame,
   onState: updateAnimationControls
 });
-const thumbnailKey = (item, profileId = defaultProfile) => renderIdentity(item, viewerProfile(profileById(profileId)), materialRules);
+const thumbnailKey = (item, profileId = defaultProfile) => renderIdentity(item, viewerProfile(profileById(profileId)));
 function showToast(message) {
   $('#toast').textContent = message;
   $('#toast').hidden = false;
@@ -244,7 +166,7 @@ function normalizeResource(record) {
   };
 }
 function normalizeObject(record) {
-  const base = resources.find(a => a.id === record.assetId || a.id === record.prefabId || a.sourceId === record.sourceId) || {};
+  const base = resources.find(a => record.assetId && a.id === record.assetId || record.sourceId && a.sourceId === record.sourceId) || {};
   const merged = {
     ...base,
     ...record
@@ -255,21 +177,20 @@ function normalizeObject(record) {
     id: String(record.id),
     name: record.displayName || objectNames[rawName] || rawName,
     originalName: record.originalName || rawName,
+    originalUrl: record.imageUrl || record.originalUrl,
     type: 'object',
     isObject: true,
     category: objectCategory(merged),
-    modelUrl: record.assemblyModelUrl || record.modelUrl || record.materialModelUrl || base.modelUrl,
+    modelUrl: record.modelUrl || base.modelUrl,
     previewUrl: record.previewUrl || record.thumbnailUrl || base.previewUrl,
     notes: Array.isArray(record.notes) ? record.notes : Array.isArray(base.notes) ? base.notes : [],
     provenance: record.provenance || base.provenance || {},
-    assemblyStatus: record.assemblyStatus || '源对象静态重组'
+    assemblyStatus: record.assemblyStatus || '目录声明 · 未验证'
   };
 }
 function allRelatedIds(object) {
   if (Array.isArray(object.assetIds)) {
     const ids = new Set(object.assetIds.filter(id => resourceMap.has(id)));
-    const root = sourceMap.get(object.sourceId);
-    if (root?.type === 'prefab') ids.add(root.id);
     return [...ids];
   }
   const ids = new Set();
@@ -296,7 +217,7 @@ function allRelatedIds(object) {
       accept(value.textureLinks);
     }
   };
-  ['assetIds', 'resourceIds', 'meshIds', 'materialIds', 'textureIds', 'animationIds', 'prefabId', 'assetId', 'meshLinks', 'materialLinks', 'textureLinks', 'animationLinks', 'components', 'links', 'relations'].forEach(k => accept(object[k]));
+  ['assetIds', 'resourceIds', 'meshIds', 'materialIds', 'textureIds', 'animationIds', 'assetId', 'meshLinks', 'materialLinks', 'textureLinks', 'animationLinks', 'components', 'links', 'relations'].forEach(k => accept(object[k]));
   if (object.sourceId && sourceMap.has(object.sourceId)) ids.add(sourceMap.get(object.sourceId).id);
   for (const id of [...ids]) {
     const resource = resourceMap.get(id);
@@ -311,53 +232,23 @@ function allRelatedIds(object) {
 function relatedResources(object, type) {
   return (object.relatedIds || []).map(id => resourceMap.get(id)).filter(a => a && (!type || a.type === type));
 }
-function dependencyResources(dependencies, type) {
-  return (dependencies?.[{
-    mesh: 'meshSourceIds',
-    material: 'materialSourceIds',
-    texture: 'textureSourceIds'
-  }[type]] || []).map(id => sourceMap.get(id)).filter(resource => resource?.type === type);
-}
 function relatedCount(object, type) {
-  const diagnostic = diagnostics.get(object.id);
-  return diagnostic && ['mesh', 'material', 'texture'].includes(type) ? dependencyResources(diagnostic.activeRenderDependencies, type).length : relatedResources(object, type).length;
+  return relatedResources(object,type).length;
 }
 function searchText(item) {
-  return [item.source, item.sourceLabel, item.nativeType, item.typeLabel, item.description, item.nativeProvenance, item.provenance?.sourceBundle, item.provenance?.serializedFile, ...(item.usagePaths || []), item.id, item.name, item.originalName, item.sourceId, item.category, item.provenance?.sourceFile, item.provenance?.pathId, ...(item.tags || []), ...(item.relatedIds || []).map(id => resourceMap.get(id)?.name), ...(canPlayAnimation(item) ? ['原曲线可播', '离线约束', 'IK'] : [])].filter(v => v !== undefined && v !== null).join(' ').toLowerCase();
+  return [item.source, item.sourceLabel, item.nativeType, item.typeLabel, item.description, item.nativeProvenance, item.provenance?.sourceBundle, item.provenance?.serializedFile, ...(item.usagePaths || []), item.id, item.name, item.originalName, item.sourceId, item.category, item.provenance?.sourceFile, item.provenance?.pathId, ...(item.tags || []), ...(item.relatedIds || []).map(id => resourceMap.get(id)?.name), ...(canPlayAnimation(item) ? ['已验证动画'] : [])].filter(v => v !== undefined && v !== null).join(' ').toLowerCase();
 }
 function normalizeProfiles(data) {
-  if (config.capabilities.sourceEvidenceOnlyProfiles) {
-    return (data?.profiles || []).filter(record => !defaultProfiles.some(p => p.id === record.id)).map(record => ({
-      ...record,
-      implemented: false,
-      status: 'not-implemented',
-      description: record.description || '仅记录原始 Shader 证据，尚未移植为浏览器渲染。'
-    }));
-  }
-  const list = Array.isArray(data) ? data : data?.profiles || [];
-  return list.map(record => {
-    const approximation = record.webApproximation || record.browserApproximation || {};
-    const id = record.id;
-    const params = approximation.parameters || approximation.uniforms || record.parameters || {};
-    const implemented = approximation.implemented !== false && record.implemented !== false && Object.keys(params).length > 0;
-    return {
-      ...record,
-      id,
-      label: record.label || record.name || {
-        paradise_marsh: 'Paradise Marsh',
-        cozy_island: 'CozyIsland',
-        hamsters_away: 'HamstersAway'
-      }[id] || id,
-      mode: approximation.mode || record.mode || (id === 'paradise_marsh' ? 'material' : 'toon'),
-      parameters: params,
-      implemented,
-      status: implemented ? 'evidence-based-approximation' : 'not-implemented',
-      description: approximation.description || record.description || record.summary || '依据已恢复的材质参数实现浏览器近似，不是原 Unity Shader。',
-      unsupportedFeatures: record.unsupportedFeatures || approximation.unsupportedFeatures || [],
-      sourceEvidence: record.sourceEvidence || [],
-      raw: record
-    };
-  });
+  const list=Array.isArray(data)?data:data?.profiles||[];
+  return list.map(record=>({
+    ...record,
+    label:record.label||record.name||record.id,
+    mode:record.mode||'material',
+    parameters:record.parameters||{},
+    implemented:record.implemented===true&&['material','clay','toon'].includes(record.mode||'material'),
+    description:record.description||'用户声明的预览参数；不是外观验证结论。',
+    unsupportedFeatures:record.unsupportedFeatures||[]
+  }));
 }
 async function readJSON(url, required = true, options = {}) {
   return resourceScope.run(async signal => {
@@ -406,28 +297,15 @@ async function init() {
       catalogOrder: index
     }));
     if (!objects.length) throw Error('物件目录暂不可用');
-    diagnostics = new Map((projectData.diagnostics?.objects || []).filter(d => objects.some(item => item.id === d.objectId && item.sourceId === d.sourceId)).map(d => [d.objectId, d]));
-    for (const object of objects) {
-      object.relatedIds = allRelatedIds(object);
-      if (diagnostics.has(object.id)) {
-        object.name += ' · 白材质模板';
-        object.description = '未配置身体贴图的 Boid 静态模板；运行时外观尚未恢复。另有已配置的 Frog Instance 可查看。';
-      }
-    }
-    const animationIndex = projectData.animationIndex,
-      actionIndex = projectData.actionIndex;
-    animationRecords = new Map((animationIndex?.objects || []).filter(record => objects.some(object => object.id === record.objectId && object.sourceId === record.sourceId)).map(record => [record.objectId, record]));
-    actionLibrary = new Map((actionIndex?.objects || []).map(o => [o.objectId, o]));
+    for (const object of objects) object.relatedIds = allRelatedIds(object);
+    const animationIndex=projectData.animationIndex;
+    animationRecords=new Map((animationIndex?.objects||[]).filter(record=>objects.some(object=>object.id===record.objectId&&object.sourceId===record.sourceId)).map(record=>[record.objectId,record]));
     const evidence = projectData.evidence;
     profileSources = evidence?.sources || [];
-    profiles = config.renderer.kind === 'entity' ? [...defaultProfiles] : commonIndexedProfiles([...defaultProfiles, ...normalizeProfiles(evidence)]);
-    materialRules = projectData.materialRules || {
-      version: 1,
-      flatCanopySourceMaterialIds: []
-    };
+    profiles = commonIndexedProfiles([...defaultProfiles, ...normalizeProfiles(evidence)]);
     defaultProfile = readDefaultProfile(localStorage, profiles);
     profileA = defaultProfile;
-    profileB = config.compareProfile || profiles.find(p => p.id !== profileA && p.implemented)?.id || profileA;
+    profileB = profiles.find(p=>p.id===config.compareProfile&&availableProfile(p))?.id || profiles.find(p => p.id !== profileA && availableProfile(p))?.id || profileA;
     items = [...objects, ...resources];
     itemMap = new Map(items.map(a => [a.id, a]));
     for (const item of items) item.searchText = searchText(item);
@@ -444,6 +322,7 @@ async function init() {
     const known = new Set(itemMap.keys());
     reviews = sanitizeReviews(reviews, known);
     selected = new Set([...selected].filter(id => known.has(id)));
+    configureSemanticUI();
     configureShell();
     buildProfiles();
     buildAudit();
@@ -463,8 +342,6 @@ async function init() {
       openItem: item => item.isObject ? openDetail(item) : openResource(item),
       getProfile: () => profileById(defaultProfile)
     });
-    if (config.capabilities.research) await buildResearch();
-    if (config.capabilities.effects) await buildWeaponEffects();
   } catch (error) {
     $('#load-error').hidden = false;
     $('#load-error').textContent = `${error.message}。请刷新重试；已保留当前审阅记录。`;
@@ -487,7 +364,7 @@ function renderNavigation() {
   const groups = objectMode ? [...new Set(objects.map(a => a.category))] : Object.keys(typeLabels).filter(type => resources.some(a => a.type === type));
   $('#side-categories').innerHTML = groups.map(group => `<button class="nav" data-${objectMode ? 'category' : 'type'}="${esc(group)}"><span>${objectMode ? '◇' : icons[group] || '◈'}</span>${esc(objectMode ? categoryLabel(group) : typeLabels[group] || group)}<b>${(objectMode ? objects : resources).filter(a => (objectMode ? a.category : a.type) === group).length}</b></button>`).join('');
   $('#tabs').innerHTML = `<button class="tab active" data-${objectMode ? 'category' : 'type'}="all" role="tab" aria-selected="true">${objectMode ? '全部物件' : '全部资源'} <span>${collection.length}</span></button>` + groups.map(group => `<button class="tab" data-${objectMode ? 'category' : 'type'}="${esc(group)}" role="tab">${esc(objectMode ? categoryLabel(group) : typeLabels[group] || group)} <span>${(objectMode ? objects : resources).filter(a => (objectMode ? a.category : a.type) === group).length}</span></button>`).join('');
-  $('#category-filter').innerHTML = '<option value="all">全部语义类别</option>' + [...new Set(collection.map(a => a.category))].map(category => `<option value="${esc(category)}">${esc(categoryLabel(category))}</option>`).join('');
+  $('#category-filter').innerHTML = '<option value="all">全部目录类别</option>' + [...new Set(collection.map(a => a.category))].map(category => `<option value="${esc(category)}">${esc(categoryLabel(category))}</option>`).join('');
   $('#category-filter').value = state.category;
   $('#category-filter').hidden = objectMode;
   $$('[data-type]').forEach(button => button.onclick = () => {
@@ -505,7 +382,7 @@ function renderStats() {
   const resourceCount = activeResources().length;
   $('#object-count').textContent = objects.length;
   $('#all-count').textContent = resourceCount;
-  $('#stat-total').textContent = projectData?.counts?.defaultAvailable ?? objects.filter(a => a.modelUrl || a.modelAsset).length;
+  $('#stat-total').textContent = objects.filter(a => a.modelUrl || a.modelAsset).length;
   $('#stat-mesh').textContent = objects.length;
   $('#stat-preview').textContent = resourceCount;
   const reviewed = items.filter(a => reviewOf(a).status !== 'pending').length;
@@ -525,65 +402,24 @@ function canPlayAnimation(item) {
 function hasAnimationReferences(item) {
   return item.isObject ? relatedResources(item, 'animation').length > 0 || (item.animationLinks || []).length > 0 : item.type === 'animation' && !!item.sourceId;
 }
-function hasEffectEvidence(item) {
-  return item.effectStatus === 'static-evidence';
-}
-function hasApproximateEffects(item) {
-  return item.effectStatus === 'approximate-effect';
-}
 function animationFilterMatches(item) {
-  return state.animation === 'all' || state.animation === 'references' && hasAnimationReferences(item) || state.animation === 'playable' && canPlayAnimation(item) || state.animation === 'effects' && hasEffectEvidence(item) || state.animation === 'approximate' && hasApproximateEffects(item);
+  return state.animation==='all'||state.animation==='references'&&hasAnimationReferences(item)||state.animation==='playable'&&canPlayAnimation(item);
 }
 function renderAnimationFilterCounts() {
-  const scope = filterItems(true),
-    references = scope.filter(hasAnimationReferences).length,
-    playable = scope.filter(canPlayAnimation).length,
-    effects = scope.filter(hasEffectEvidence).length,
-    approx = scope.filter(hasApproximateEffects).length;
-  $('#animation-filter').innerHTML = `<option value="all">全部恢复状态</option><option value="references">含动画引用（${references}）</option><option value="playable">有可播片段的物件（${playable}）</option><option value="effects">特效静态证据（${effects}）</option><option value="approximate">近似特效（${approx}）</option>`;
-  $('#animation-filter').value = state.animation;
-  $('#animation-filter-hint').textContent = `${references} 项含动画引用 · ${playable} 个物件有已验证片段（非完整流程） · ${effects} 项特效静态证据 · ${approx} 项近似特效。四者不等价；材质近似也不代表特效可播放。`;
-}
-async function buildResearch() {
-  const data = mapResourceData(await readJSON(assetURL(config, config.researchUrl), false), resourceResolver);
-  const content = $('#research-content');
-  if (!data) {
-    content.innerHTML = '<p>程序与地形证据尚未导入此候选。</p>';
-    return;
-  }
-  content.innerHTML = `<p class="resource-note">${esc(data.scope || '仅静态分析原始文件，未执行游戏二进制。')}</p><div class="research-facts">${(data.facts || []).map(f => `<section><span>${esc(f.label)}</span><strong>${esc(f.value)}</strong><p>${esc(f.note || '')}</p></section>`).join('')}</div>${(data.sections || []).map(section => `<section class="research-section"><h3>${esc(section.title)}</h3><p>${esc(section.summary)}</p>${section.points ? '<ul>' + section.points.map(point => `<li>${esc(point)}</li>`).join('') + '</ul>' : ''}${(section.sources || []).map(source => `<a class="light-btn" href="${esc(source.url)}" download>${esc(source.label)} ↓</a>`).join(' ')}</section>`).join('')}<p class="resource-note">${esc(data.limitations || '静态 CIL 与资源引用不能证明运行时效果，推断另作标注。')}</p>`;
-}
-function focusWeapons() {
-  changeView('objects');
-  state.category = 'weapons';
-  state.page = 1;
-  renderNavigation();
-  render();
-  $('#view-title').scrollIntoView({
-    block: 'start'
-  });
-}
-async function buildWeaponEffects() {
-  const content = $('#weapon-effects-content');
-  weaponEffects = mapResourceData(await readJSON(assetURL(config, config.effectsUrl), false), resourceResolver);
-  if (!weaponEffects) {
-    content.innerHTML = '<p>本批尚未接入特效静态证据。没有可播放或近似特效，原曲线不触发枪口、弹道或弹壳。</p>';
-    return;
-  }
-  content.innerHTML = renderWeaponEffects(weaponEffects);
-}
-function renderWeaponEffects(data) {
-  return `<p class="resource-note">静态证据，不是特效播放。未执行游戏程序集、GPU 程序、粒子系统、IK 或物理；本批不提供近似弹道演示。</p><div class="effect-evidence-grid">${(data.sections || []).map(s => `<section class="research-section"><span class="evidence-label">${esc(s.level || 'observed')} · 静态证据</span><h3>${esc(s.title)}</h3><p>${esc(s.summary)}</p><ul>${(s.points || []).map(p => `<li>${esc(p)}</li>`).join('')}</ul>${(s.sources || []).map(r => `<a class="light-btn" href="${esc(r.url)}" download>${esc(r.label)} ↓</a>`).join('')}</section>`).join('')}</div><h3>真实源贴图 · 非动态效果</h3><div class="effect-textures">${(data.figures || []).map(f => `<figure><img src="${esc(f.url)}" loading="lazy" alt="${esc(f.name)} 原始贴图"><figcaption><strong>${esc(f.name)}</strong><br>${esc(f.label)}<br><small>${esc(f.sourceObject)}</small></figcaption></figure>`).join('')}</div><h3>静态效果网格 · 可下载核对</h3><ul>${(data.meshes || []).map(m => `<li>${esc(m.name)} · ${m.vertices} 顶点 / ${m.triangles} 三角面 · <a href="${esc(m.objUrl)}" download>OBJ</a> / <a href="${esc(m.jsonUrl)}" download>原坐标 JSON</a></li>`).join('')}</ul><p>${esc(data.limitations || '静态程序不能证明实际运行时像素。')}</p>`;
+  const scope=filterItems(true),references=scope.filter(hasAnimationReferences).length,playable=scope.filter(canPlayAnimation).length;
+  $('#animation-filter').innerHTML=`<option value="all">全部动画状态</option><option value="references">含动画引用（${references}）</option><option value="playable">已验证片段（${playable}）</option>`;
+  $('#animation-filter').value=state.animation;
+  $('#animation-filter-hint').textContent=`${references} 项含动画引用 · ${playable} 个物件有已验证片段。引用、解析和验证互不等同。`;
 }
 function hasPreview(item) {
-  return !!(item.previewUrl || item.modelUrl);
+  return !!(item.previewUrl || item.modelUrl || item.modelAsset || item.imageUrl || item.originalUrl);
 }
 function facetMatches(item) {
-  return Object.entries(state.facets).every(([key, value]) => !item.isObject && ['publication', 'renderer'].includes(key) || value === 'all' || value === false || value === '' || (Array.isArray(item.facets?.[key]) ? item.facets[key].includes(value) : item.facets?.[key] === value));
+  return Object.entries(state.facets).every(([key, value]) => value === 'all' || value === false || value === '' || (Array.isArray(item.facets?.[key]) ? item.facets[key].includes(value) : item.facets?.[key] === value));
 }
 function filterItems(ignoreAnimation = false) {
   const query = state.query.toLowerCase().split(/\s+/).filter(Boolean);
-  let result = activeCollection().filter(a => facetMatches(a) && (state.type === 'all' || a.type === state.type) && (state.category === 'all' || a.category === state.category) && query.every(q => a.searchText.includes(q)) && (state.review === 'all' || reviewOf(a).status === state.review) && (state.preview === 'all' || state.preview === 'yes' === hasPreview(a)) && (!config.capabilities.animationFilters || ignoreAnimation || animationFilterMatches(a)));
+  let result = activeCollection().filter(a => (!semanticUI || semanticUI.model.matches(a,state.semantic)) && facetMatches(a) && (state.type === 'all' || a.type === state.type) && (state.category === 'all' || a.category === state.category) && query.every(q => a.searchText.includes(q)) && (state.review === 'all' || reviewOf(a).status === state.review) && (state.preview === 'all' || state.preview === 'yes' === hasPreview(a)) && (!config.capabilities.animationFilters || ignoreAnimation || animationFilterMatches(a)));
   result.sort((a, b) => state.sort === 'triangles' ? (b.triangleCount ?? -1) - (a.triangleCount ?? -1) || a.name.localeCompare(b.name) : state.sort === 'name' ? a.name.localeCompare(b.name, undefined, {
     numeric: true
   }) : state.sort === 'type' ? a.type.localeCompare(b.type) || a.name.localeCompare(b.name) : Number(!!b.featured) - Number(!!a.featured) || (b.sortRank || 0) - (a.sortRank || 0) || Number(hasPreview(b)) - Number(hasPreview(a)) || (a.isObject && b.isObject ? a.catalogOrder - b.catalogOrder : 0) || a.name.localeCompare(b.name, undefined, {
@@ -591,17 +427,11 @@ function filterItems(ignoreAnimation = false) {
   }));
   return result;
 }
-function neutralFallbacks(item) {
-  return (item.materialLinks || []).filter(material => (material.portNotes || []).some(note => /shown neutral|neutral fallback/i.test(note)));
-}
 function previewLabel(item) {
-  if (item.assemblyStatus && item.sourceRecord) return item.assemblyStatus;
   if (item.previewStatusLabel) return item.previewStatusLabel;
   if (config.presentation === 'indexed-source') {
-    if (item.appearanceStatus === 'partial_custom_shader') return '局部外观未恢复 · 自定义水面';
-    if (item.isObject && !item.modelUrl) return '已索引 · 尚无完整预览';
-    if (item.isObject && neutralFallbacks(item).length) return '源材质组合 · 含未实现材质';
-    if (item.isObject) return item.materialReady === false ? '结构恢复 · 材质待补' : '源层级与材质 · 静态预览';
+    if (item.isObject && !item.modelUrl && !item.modelAsset) return imageObjectPreviewLabel(item);
+    if (item.isObject) return item.materialReady === false ? '模型入口 · 材质待补' : '源层级与材质 · 静态预览';
     return {
       'mesh-clay': '真实网格 · 中性材质',
       'original-texture': '原始贴图',
@@ -610,9 +440,8 @@ function previewLabel(item) {
       'hierarchy-clay': '源层级白模'
     }[item.previewMode] || '源资源预览';
   }
-  if (diagnostics.has(item.id)) return '白材质静态模板 · 运行时未恢复';
   if (item.isObject && neutralFallbacks(item).length) return '源材质组合 · 含未实现程序材质';
-  if (item.isObject) return item.materialReady === false ? '结构恢复 · 材质待补' : '源材质组合预览';
+  if (item.isObject) return item.materialReady === false ? '模型入口 · 材质待补' : '源材质组合预览';
   return {
     'mesh-clay': '中性材质预览',
     'original-texture': '原始贴图',
@@ -626,13 +455,13 @@ function imageHTML(item, original = false, renderMode = false) {
     const cached = previewQueue?.peek(thumbnailKey(item));
     return `<span class="rendered-preview" data-render-id="${esc(item.id)}"><img src="${esc(cached || item.previewUrl || assetURL(config, config.pendingPreview || 'assets/preview-pending.svg'))}" alt="${esc(item.name)} · ${esc(cached ? profileTitle(profileById(defaultProfile)) : '源材质缩略图')}" loading="lazy" decoding="async"><span class="render-preview-state ${cached ? 'ready' : 'pending'}">${esc(cached ? profileTitle(profileById(defaultProfile)) : item.previewUrl ? '源材质缩略图 · 可见后更新模式' : '真实 GLB · 等待生成预览')}</span></span>`;
   }
-  const url = original ? item.originalUrl || item.previewUrl : item.previewUrl;
+  const url = original ? item.originalUrl || item.imageUrl || item.previewUrl : item.previewUrl || item.imageUrl || item.originalUrl;
   return url ? `<img src="${esc(url)}" alt="${esc(item.name)} · ${esc(previewLabel(item))}" loading="lazy" decoding="async">` : `<div class="placeholder-preview"><strong>${icons[item.type] || '◈'}</strong><span>${item.type === 'animation' ? '动画元数据 · 无播放预览' : '没有可视预览，保留真实源记录'}</span></div>`;
 }
 function cardHTML(item) {
   const status = reviewOf(item).status,
     counts = item.isObject ? ['mesh', 'material', 'texture'].map(type => [type, relatedCount(item, type)]) : [];
-  return `<article class="asset-card ${item.isObject ? 'object-card' : ''} ${selected.has(item.id) ? 'selected' : ''}" data-id="${esc(item.id)}"><input class="card-check" type="checkbox" aria-label="选择 ${esc(item.name)}" ${selected.has(item.id) ? 'checked' : ''}><span class="card-review ${status}">${REVIEW_STATUSES[status]}</span><button class="card-preview ${state.bg}" aria-label="查看 ${esc(item.name)}">${imageHTML(item, false, true)}<span class="card-type">${esc(item.isObject ? categoryLabel(item.category) : typeLabels[item.type] || item.type)}${item.modelUrl ? ' · 3D' : ''}</span>${item.isObject ? `<span class="recovery-badge">${esc(item.recoveryLabel || (diagnostics.has(item.id) ? '白材质模板 · 见彩色实例' : neutralFallbacks(item).length ? '含中性材质回退' : '源引用整合'))}</span>` : ''}</button><div class="card-body" role="button" tabindex="0" aria-label="查看 ${esc(item.name)} 详情"><h3 title="${esc(item.name)}">${esc(item.name)}</h3>${item.isObject ? `<p class="card-description">${esc(item.description || item.originalName || '原始层级、材质与贴图的完整组合')}</p><div class="component-chips">${counts.filter(([, count]) => count).map(([type, count]) => `<span>${count} ${typeLabels[type]}</span>`).join('')}${hasEffectEvidence(item) ? '<span class="evidence-chip">特效 · 静态证据</span>' : ''}${canPlayAnimation(item) ? `<span class="animation-chip">▶ ${actionsFor(item).filter(a => a.classification === 'source_clip').length || animationRecords.get(item.id).playableClipIds.length} 源动作${actionsFor(item).some(a => a.classification === 'derived_source_state_flow') ? ' + 完整流程' : ''}</span>` : ''}<span>${fmt(item.triangleCount)} 面</span></div>` : `<div class="card-meta"><span>${item.triangleCount !== undefined ? fmt(item.triangleCount) + ' 三角面' : previewLabel(item)}</span><span>${esc(categoryLabel(item.category))}</span></div>`}<div class="card-source">${esc(item.provenance?.sourceFile || item.sourceId || item.id)}${item.provenance?.pathId !== undefined ? ' · #' + esc(item.provenance.pathId) : ''}</div></div></article>`;
+  return `<article class="asset-card ${item.isObject ? 'object-card' : ''} ${selected.has(item.id) ? 'selected' : ''}" data-id="${esc(item.id)}"><input class="card-check" type="checkbox" aria-label="选择 ${esc(item.name)}" ${selected.has(item.id) ? 'checked' : ''}><span class="card-review ${status}">${REVIEW_STATUSES[status]}</span><button class="card-preview ${state.bg}" aria-label="查看 ${esc(item.name)}">${imageHTML(item, false, true)}<span class="card-type">${esc(item.isObject ? categoryLabel(item.category) : typeLabels[item.type] || item.type)}${item.modelUrl ? ' · 3D' : ''}</span>${item.isObject ? `<span class="recovery-badge">${esc(item.recoveryLabel || '目录声明 · 未验证')}</span>` : ''}</button><div class="card-body" role="button" tabindex="0" aria-label="查看 ${esc(item.name)} 详情"><h3 title="${esc(item.name)}">${esc(item.name)}</h3>${item.isObject ? `<p class="card-description">${esc(item.description || item.originalName || '原始层级、材质与贴图的完整组合')}</p><div class="component-chips">${counts.filter(([, count]) => count).map(([type, count]) => `<span>${count} ${typeLabels[type]}</span>`).join('')}${canPlayAnimation(item) ? `<span class="animation-chip">▶ ${animationRecords.get(item.id).playableClipIds.length} 已验证片段</span>` : ''}<span>${fmt(item.triangleCount)} 面</span></div>` : `<div class="card-meta"><span>${item.triangleCount !== undefined ? fmt(item.triangleCount) + ' 三角面' : previewLabel(item)}</span><span>${esc(categoryLabel(item.category))}</span></div>`}${semanticCardHTML(item)}<div class="card-source">${esc(item.provenance?.sourceFile || item.sourceId || item.id)}${item.provenance?.pathId !== undefined ? ' · #' + esc(item.provenance.pathId) : ''}</div></div></article>`;
 }
 function render() {
   document.body.dataset.mode = isObjectView() ? 'objects' : 'technical';
@@ -653,6 +482,8 @@ function render() {
   $('#render-summary').hidden = !isObjectView();
   $('#result-description').textContent = `共 ${fmt(filtered.length)} ${isObjectView() ? '个物件' : '项资源'}${state.query ? ' · 搜索「' + state.query + '」' : ''}`;
   renderPagination(page);
+  renderCatalogueSummary(page);
+  semanticUI?.update();
   if (config.capabilities.animationFilters) renderAnimationFilterCounts();
   $$('[data-view]').forEach(button => button.classList.toggle('active', button.dataset.view === state.view));
   $$('[data-type]').forEach(button => button.classList.toggle('active', button.dataset.type === state.type));
@@ -679,6 +510,35 @@ function render() {
   });
   renderStats();
   scheduleCardPreviews();
+}
+function semanticCatalogItems() {
+  return [...new Map([...objects,...activeResources()].map(item=>[item.id,item])).values()];
+}
+function configureSemanticUI() {
+  semanticUI?.dispose();
+  let storage;
+  try { storage=localStorage; } catch { /* UI reports nonpersistent mode below. */ }
+  semanticUI=mountSemanticUI({host:$('#semantic-workbench'),identity:{projectId:config.projectId || config.id,datasetId:config.datasetId},items:semanticCatalogItems(),storage,
+    getScope:()=>semanticViewScope(semanticCatalogItems(),filtered,pageSlice(filtered,state.page).items),
+    getQuery:()=>state.semantic,setQuery:query=>{state.semantic=query;state.page=1;},onChange:render,download,notify:showToast});
+}
+function semanticCardHTML(item) {
+  if(!semanticUI)return '';
+  const value=semanticUI.model.effective(item);
+  return `<p class="semantic-card">${esc(value.dimension)} · ${esc([...value.directCategories,...value.tags].join(' / ') || '未标注')}${value.needsReview?' · 待语义复核':''}</p>`;
+}
+function renderCatalogueSummary(page) {
+  const summary = catalogueSummary({config,objects,resources:activeResources(),matched:filtered,page,state});
+  $('#catalogue-identity').textContent = `projectId: ${summary.projectId} · datasetId: ${summary.datasetId}`;
+  $('#catalogue-counts').textContent = `全目录 ${summary.objects} 个物件 / ${summary.resources} 项技术资源 · ${Object.entries(summary.byType).map(([type,count])=>`${type}: ${count}`).join(' / ')} · 当前匹配 ${summary.matched} · 本页 ${summary.range}`;
+  $('#catalogue-evidence').textContent = `${summary.modelEntrances} 个模型入口（不等于完整物件） · 覆盖/包含：${summary.coverage ? `声明 ${summary.coverage.declared}，未知 ${summary.coverage.unknown}，闭合包含声明 ${summary.coverage.contains}，悬空/自引用 ${summary.coverage.unresolved}，重叠子项 ${summary.coverage.overlaps}` : '未知（未声明根/子层级/技术预览关系）'}。准备状态、CPU 数值、GPU 加载、外观和动画证据彼此独立；未提供证据即未知。`;
+  const host=$('#active-conditions'); host.replaceChildren();
+  for(const condition of summary.conditions) {
+    const button=document.createElement('button'); button.className='light-btn';
+    button.textContent=`${condition.label}: ${condition.value} ×`; button.setAttribute('aria-label',`清除 ${condition.label}: ${condition.value}`);
+    button.onclick=()=>{clearCondition(state,condition.key); $('#search').value=state.query; $('#category-filter').value=state.category; $('#review-filter').value=state.review; $('#preview-filter').value=state.preview; renderFacetControls(); renderNavigation(); render();}; host.append(button);
+  }
+  if(!summary.conditions.length) host.textContent='无活动筛选（当前视图范围独立于筛选）';
 }
 function renderPagination(page) {
   $('#shown-count').textContent = page.total ? `显示 ${fmt(page.start)}–${fmt(page.end)} / ${fmt(page.total)} 项` : '显示 0 / 0 项';
@@ -708,7 +568,7 @@ function toggleSelection(id, on) {
 }
 function metricHTML(item) {
   let rows;
-  if (item.isObject) rows = [[diagnostics.has(item.id) ? '启用模型资源' : '模型资源', relatedCount(item, 'mesh') || item.meshCount || '未关联'], [diagnostics.has(item.id) ? '启用材质' : '关联材质', relatedCount(item, 'material')], [diagnostics.has(item.id) ? '身体贴图' : '关联贴图', relatedCount(item, 'texture')], ['原始节点', item.nodeCount ?? '见层级']];else if (item.type === 'texture') rows = [['尺寸', `${item.width ?? '未知'} × ${item.height ?? '未知'}`], ['格式', item.format || '未提取'], ['Path ID', item.provenance?.pathId], ['预览', previewLabel(item)]];else if (item.type === 'animation') rows = [['时长', item.duration === undefined ? '未提取' : item.duration + ' 秒'], ['采样率', item.sampleRate], ['循环', item.loop === undefined ? '未提取' : item.loop ? '是' : '否'], ['播放', '本页未实现']];else if (item.type === 'program') rows = [['程序集', item.assembly], ['文件大小', fmt(item.byteSize) + ' B'], ['来源', 'ILSpy重建'], ['执行', '未执行']];else if (item.type === 'material') rows = [['Shader', item.shaderName], ['关联贴图', item.textureCount], ['浮点参数', item.floatParameterCount], ['颜色参数', item.colorParameterCount]];else rows = [['顶点', fmt(item.vertexCount)], ['三角面', fmt(item.triangleCount)], ['材质', item.materialIds?.length ?? '未关联'], ['骨骼', item.boneCount ?? '未提取']];
+  if (item.isObject) rows = [['模型资源', relatedCount(item, 'mesh') || item.meshCount || '未关联'], ['关联材质', relatedCount(item, 'material')], ['关联贴图', relatedCount(item, 'texture')], ['原始节点', item.nodeCount ?? '见层级']];else if (item.type === 'texture') rows = [['尺寸', `${item.width ?? '未知'} × ${item.height ?? '未知'}`], ['格式', item.format || '未提取'], ['Path ID', item.provenance?.pathId], ['预览', previewLabel(item)]];else if (item.type === 'animation') rows = [['时长', item.duration === undefined ? '未提取' : item.duration + ' 秒'], ['采样率', item.sampleRate], ['循环', item.loop === undefined ? '未提取' : item.loop ? '是' : '否'], ['播放', '本页未实现']];else if (item.type === 'material') rows = [['Shader', item.shaderName], ['关联贴图', item.textureCount], ['浮点参数', item.floatParameterCount], ['颜色参数', item.colorParameterCount]];else rows = [['顶点', fmt(item.vertexCount)], ['三角面', fmt(item.triangleCount)], ['材质', item.materialIds?.length ?? '未关联'], ['骨骼', item.boneCount ?? '未提取']];
   return rows.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value ?? '未提取')}</strong></div>`).join('');
 }
 function coverageText(item) {
@@ -720,41 +580,30 @@ function printable(value) {
 }
 function provenanceHTML(item) {
   const p = item.provenance || {},
-    rows = [['资源包', p.sourceBundle], ['序列化文件', p.serializedFile], ['恢复性质', p.label || item.assemblyStatus], ['源文件', p.sourceFile], ['Path ID', p.pathId], ['稳定标识', item.sourceId || item.id], ['源归档', p.archive], ['原始名称', item.originalName], ['顶点 / 面', item.vertexCount !== undefined ? `${fmt(item.vertexCount)} / ${fmt(item.triangleCount)}` : null], ['数据通道', item.channels], ['原始 Shader', item.shaderName], ['使用位置', item.usagePaths], ['坐标转换', item.coordinateSystem || item.boundsCoordinateSystem], ['源对象 SHA256', p.sourceObjectSha256], [animationRecords.has(item.id) ? '源静态导出说明（另行恢复的动作见播放区）' : '说明', item.notes?.join('；')]];
+    rows = [['资源包', p.sourceBundle], ['序列化文件', p.serializedFile], ['目录状态', p.label || item.assemblyStatus], ['源文件', p.sourceFile], ['Path ID', p.pathId], ['稳定标识', item.sourceId || item.id], ['源归档', p.archive], ['原始名称', item.originalName], ['顶点 / 面', item.vertexCount !== undefined ? `${fmt(item.vertexCount)} / ${fmt(item.triangleCount)}` : null], ['数据通道', item.channels], ['原始 Shader', item.shaderName], ['使用位置', item.usagePaths], ['坐标转换', item.coordinateSystem || item.boundsCoordinateSystem], ['源对象 SHA256', p.sourceObjectSha256], [animationRecords.has(item.id) ? '动画来源说明' : '说明', item.notes?.join('；')]];
   return rows.filter(([, value]) => value !== null && value !== undefined && value !== '').map(([label, value]) => `<dt>${esc(label)}</dt><dd>${esc(printable(value))}</dd>`).join('');
 }
 function downloadsHTML(item) {
-  return [[item.metadataUrl, item.metadataUrl?.includes('#') ? '索引元数据分片' : '完整元数据'], [item.modelAsset ? null : item.modelUrl, item.isObject ? '原始轨道 GLB' : '几何 GLB'], [item.ikMetadataUrl, '源约束离线重建元数据'], [animationRecords.get(item.id)?.variants?.constraint?.modelUrl, '离线约束 GLB（非 Unity 运行）'], [item.originalUrl, '原始图像'], [item.sourceCodeUrl, '反编译 C# 文本'], ...(item.downloads || []).filter(d => d.kind === 'url').map(d => [d.url, d.label])].filter(([url]) => url).map(([url, label]) => `<a class="light-btn" href="${esc(url)}" download>↓ ${esc(label)}</a>`).join('');
+  return [[item.metadataUrl,'目录元数据'],[item.modelAsset?null:item.modelUrl,'GLB 模型'],[item.originalUrl,'原始图像'],...(item.downloads||[]).filter(d=>d.kind==='url').map(d=>[d.url,d.label])].filter(([url])=>url).map(([url,label])=>`<a class="light-btn" href="${esc(url)}" download>↓ ${esc(label)}</a>`).join('');
 }
 function relationGroupHTML(type, linked, label = type === 'animation' ? '动作元数据' : typeLabels[type] || {
   material: '材质',
-  prefab: 'Prefab'
-}[type] || type, empty = '当前恢复记录中没有可验证关联。') {
+}[type] || type, empty = '目录没有声明此类关联。') {
   return `<details class="relation-group" ${['material', 'texture'].includes(type) ? 'open' : ''}><summary>${esc(label)}<span>${linked.length} 项</span></summary>${linked.length ? `${type === 'animation' ? '<p class="relation-empty">只有带 ▶ 的条目能播放独立片段；其余仅打开源元数据，尚未转换或验证。原始 Clip 完整时域不等于完整游戏动作；纯事件片段也不代表骨骼运动。</p>' : ''}<div class="relation-list">${linked.map(resource => `<button data-related="${esc(resource.id)}" title="${esc(resource.name)}">${esc(resource.name)}${type === 'animation' ? '<small>引用 · 未转换 · 查看元数据 ↗</small>' : ''}</button>`).join('')}</div>${type === 'texture' ? `<div class="relation-thumbnails">${linked.filter(a => a.previewUrl).slice(0, 12).map(resource => `<button data-related="${esc(resource.id)}" aria-label="查看贴图 ${esc(resource.name)}"><img src="${esc(resource.previewUrl)}" alt="${esc(resource.name)}"></button>`).join('')}</div>` : ''}` : `<div class="relation-empty">${esc(empty)}</div>`}</details>`;
 }
-function sourceObjectLinksHTML(item) {
-  const diagnostic = diagnostics.get(item.id);
-  if (diagnostic) {
-    const related = (diagnostic.relatedSourceObjects || []).filter(link => itemMap.get(link.objectId)?.sourceId === link.sourceId);
-    return `<section class="source-object-diagnostic"><h3>白材质模板，不是贴图丢失的彩色实例</h3><p>${esc(diagnostic.displayNotice)}</p>${related.map(link => `<button class="primary-btn" data-object-related="${esc(link.objectId)}">查看原有贴图实例 ${esc(link.name)}</button><p>${esc(link.relationship)}</p>`).join('')}<details><summary>静态源证据与未恢复范围</summary><p>启用 ${diagnostic.activeRenderDependencies.enabledRendererCount} 个渲染器，其中 ${diagnostic.activeRenderDependencies.sourceZeroScaleRendererCount} 个保留源零缩放。禁用组件不参与预览。${esc(diagnostic.geometryFindings.note)}</p><p>${esc(diagnostic.runtimeEvidenceSummary.notes.join('；'))}</p><a href="${esc(assetURL(config, '/assets/object-display-diagnostics.json'))}" download>下载诊断与精确引用依据</a></details></section>`;
-  }
-  const parent = [...diagnostics.values()].find(d => (d.relatedSourceObjects || []).some(link => link.objectId === item.id && link.sourceId === item.sourceId));
-  return parent ? `<section class="source-object-diagnostic"><h3>原有贴图实例 · 独立源对象</h3><p>当前物件原本明确绑定 Frog_Mat → FrogTex。与白材质 Boid 模板共用 15 份源网格与 UV，但源对象和材质绑定不同，未替换 Boid 的原始材质。</p><button class="light-btn" data-object-related="${esc(parent.objectId)}">查看白材质 Boid 模板与诊断</button></section>` : '';
-}
 function relationsHTML(item) {
-  if (!item.isObject) return '';
-  const diagnostic = diagnostics.get(item.id);
-  if (diagnostic) return sourceObjectLinksHTML(item) + '<h3>启用渲染依赖 · 当前预览</h3>' + ['mesh', 'material', 'texture'].map(type => relationGroupHTML(type, dependencyResources(diagnostic.activeRenderDependencies, type), typeLabels[type], type === 'texture' ? '当前启用材质未绑定身体贴图；FrogTex 只出现在下方禁用组件。' : '没有此类引用。')).join('') + '<h3>禁用组件参考 · 不参与当前预览</h3><p class="resource-note">源禁用 Cube → Spectral_Test2 → FrogTex。仅用于溯源，不是当前身体贴图。</p>' + ['mesh', 'material', 'texture'].map(type => relationGroupHTML(type, dependencyResources(diagnostic.inactiveComponentReferences, type))).join('') + relationGroupHTML('animation', relatedResources(item, 'animation'), '动作元数据', '尚无可验证的动作关联，未擅自绑定；本页不提供播放。');
-  return sourceObjectLinksHTML(item) + '<h3>这个物件由什么组成</h3>' + ['mesh', 'material', 'texture', 'animation', 'prefab'].map(type => relationGroupHTML(type, relatedResources(item, type), type === 'animation' && canPlayAnimation(item) ? '动画 · 可播片段与未转换引用' : undefined, type === 'animation' ? '尚无可验证的动作关联，未擅自绑定；可在技术资源查看动画元数据。' : '当前恢复记录中没有可验证关联。')).join('');
+  if(!item.isObject)return '';
+  return '<h3>目录声明的组成资源</h3>'+['mesh','material','texture','animation'].map(type=>relationGroupHTML(type,relatedResources(item,type),undefined,'目录没有声明此类关联。')).join('');
 }
 function profileById(id) {
-  return profiles.find(p => p.id === id) || profiles[0];
+  return profiles.find(p => p.id === id && availableProfile(p)) || profiles.find(availableProfile);
 }
 function profileTitle(profile) {
   return profile.status === 'evidence-based-approximation' && !/近似/.test(profile.label) ? profile.label + ' · 参数近似' : profile.label;
 }
 function viewerProfile(profile) {
-  const mode = profile.mode === 'banded' || profile.mode === 'banded_toon' || profile.mode === 'mk-toon' ? 'toon' : profile.mode === 'source' ? 'material' : profile.mode;
+  if(!availableProfile(profile))throw Error('不支持的预览模式');
+  const mode = profile.mode;
   return {
     ...profile,
     mode,
@@ -762,24 +611,18 @@ function viewerProfile(profile) {
   };
 }
 function buildProfiles() {
-  const implemented = profiles.filter(p => p.implemented);
+  const implemented = profiles.filter(availableProfile);
   const options = implemented.map(profile => `<option value="${esc(profile.id)}">${esc(profileTitle(profile))}</option>`).join('');
   for (const [id, value] of [['default-profile', defaultProfile], ['profile-a', profileA], ['profile-b', profileB]]) {
     $('#' + id).innerHTML = options;
     $('#' + id).value = value;
   }
-  $('#profiles-content').innerHTML = '<p>渲染方式只改变预览，不修改资产。风格预设用于比较形体、颜色和光照，不等同于原游戏画面。</p>' + profiles.map(p => `<section class="profile-evidence-card"><h3>${esc(p.label)}</h3><p>${esc(p.implemented ? p.description || '可用于当前预览。' : '此模式尚不支持，仅保留来源说明。')}</p>${p.unsupportedFeatures?.length ? `<details><summary>限制与技术参数</summary><p>${esc(p.unsupportedFeatures.join('；'))}</p><code>${esc(JSON.stringify(p.parameters || {}))}</code></details>` : ''}</section>`).join('');
-}
-function hasCanopyRule(item) {
-  return item?.isObject && ((item.materialLinks || []).some(material => (materialRules.flatCanopySourceMaterialIds || []).includes(material.sourceId)) || (materialRules.flatCanopyTriangleRules || []).some(rule => (rule.objectSourceIds || []).includes(item.sourceId)));
-}
-function canopyRuleNote(item, id) {
-  return hasCanopyRule(item) && viewerProfile(profileById(id)).mode === 'toon' ? ' 自定义调试规则：已核验树冠锁定源贴图主色并保留透明轮廓，所有卡通模式同色、不随面片朝向变化；不是原 Shader 还原。' : '';
+  $('#profiles-content').innerHTML = '<p>渲染方式只改变预览，不修改资产。风格预设用于比较形体、颜色和光照，不等同于原游戏画面。</p>' + profiles.map(p => `<section class="profile-evidence-card"><h3>${esc(p.label)}</h3><p>${esc(availableProfile(p) ? p.description || '可用于当前预览。' : '此模式尚不支持，仅保留来源说明。')}</p>${p.unsupportedFeatures?.length ? `<details><summary>限制与技术参数</summary><p>${esc(p.unsupportedFeatures.join('；'))}</p><code>${esc(JSON.stringify(p.parameters || {}))}</code></details>` : ''}</section>`).join('');
 }
 function updateProfileNotes() {
   for (const [suffix, id] of [['a', profileA], ['b', profileB]]) {
     const profile = profileById(id);
-    $(`#profile-note-${suffix}`).textContent = profile.description + canopyRuleNote(current, id);
+    $(`#profile-note-${suffix}`).textContent = profile.description;
   }
 }
 function syncCamera(camera, source) {
@@ -814,21 +657,15 @@ function updateAnimationControls(state) {
   $('#animation-toggle').textContent = state.playing ? 'Ⅱ 暂停' : '▶ 播放';
   $('#animation-toggle').setAttribute('aria-label', state.playing ? '暂停当前原始动作' : '播放当前原始动作');
   $('#animation-toggle').setAttribute('aria-pressed', String(state.playing));
-  $('#animation-clip').value = currentAction()?.id || state.clipId || '';
+  $('#animation-clip').value = state.clipId || '';
   $('#animation-speed').value = String(state.speed);
   $('#animation-seek').value = state.duration ? String(Math.round(state.time / state.duration * 1000)) : '0';
   $('#animation-seek').setAttribute('aria-valuetext', formatAnimationTime(state.time) + ' / ' + formatAnimationTime(state.duration));
   $('#animation-time').textContent = formatAnimationTime(state.time) + ' / ' + formatAnimationTime(state.duration);
   const clip = animationClips.find(clip => clip.id === state.clipId);
   $('#animation-repeat').value = state.loopMode || 'source';
-  const action = currentAction();
-  $('#animation-current-summary').textContent = action ? `${actionRole(action)} · ${action.conditions || '完整源 Clip 时域；不执行事件 / 物理 / 特效'}${state.loopMode === 'repeat' ? ' · 只重复当前选择' : ''}` : clip ? `${clip.name} · ${formatAnimationTime(clip.duration)} · 独立片段` : '';
-  const pose = action?.classification === 'static_pose';
-  $('#animation-toggle').disabled = pose || actionGroup === 'references';
-  $('#animation-repeat').disabled = pose || actionGroup === 'references';
-  $('#animation-seek').disabled = pose || actionGroup === 'references';
-  $('#animation-speed').disabled = pose || actionGroup === 'references';
-  $('#animation-toggle').textContent = pose ? '静态姿势' : state.playing ? 'Ⅱ 暂停' : '▶ 播放';
+  $('#animation-current-summary').textContent=clip?`${clip.name} · ${formatAnimationTime(clip.duration)} · 独立片段`:'';
+  for(const id of ['animation-toggle','animation-repeat','animation-seek','animation-speed'])$('#'+id).disabled=!clip;
   $('#animation-source').hidden = !sourceMap.has(clip?.sourceId);
   $('#animation-loop').textContent = clip ? state.loopMode === 'repeat' ? '重复当前选择' : state.loopMode === 'once' ? '仅一次' : clip.loop ? '源设置：循环' : '源设置：单次' : '';
   const clipNote = clip?.limitations?.[0] || '';
@@ -839,12 +676,7 @@ function updateAnimationControls(state) {
   $('#animation-clip-limitations').hidden = !clipEvidence;
 }
 function showAnimationAvailability(item, record) {
-  $('#animation-library-wrap').hidden = !actionsFor(item).length;
-  const base = animationRecords.get(item.id),
-    hasConstraint = verifiedAnimationRecord(base?.variants?.constraint);
-  $('#animation-mode-wrap').hidden = !hasConstraint;
-  $('#animation-mode').value = hasConstraint ? animationMode : 'source';
-  $('#animation-heading-label').textContent = record?.evaluation === 'source_constraint_baked' ? '离线约束重建 · 非 Unity 实际运行' : record ? '原始轨道 · 缺少 IK' : '动画引用 · 尚未转换';
+  $('#animation-heading-label').textContent=record?'已验证动画片段':'动画引用';
   const hasReferences = item.isObject && relatedResources(item, 'animation').length > 0;
   $('#animation-panel').hidden = !hasReferences && !record;
   $('#animation-controls').hidden = true;
@@ -856,61 +688,30 @@ function showAnimationAvailability(item, record) {
   $('#animation-overall-limitations').hidden = true;
   $('#animation-overall-limitations-text').textContent = '';
 }
-function bindAnimationControls(item, record, preserved, animationData) {
-  animationClips = verifiedViewerClips(record, viewerA?.getAnimationClips?.() || []).map(clip => ({
-    ...clip,
-    sourceId: clip.sourceId || clip.sourceClipId
-  }));
+function bindAnimationControls(item,record,preserved,animationData) {
+  animationClips=verifiedViewerClips(record,viewerA?.getAnimationClips?.()||[]).map(clip=>({...clip,sourceId:clip.sourceId||clip.sourceClipId}));
   playback.configure(animationClips);
-  $('#animation-controls').hidden = !animationClips.length;
-  $('#animation-panel').hidden = !animationClips.length && !record && !relatedResources(item, 'animation').length;
-  $('#animation-clip').disabled = false;
-  $('#animation-clip').innerHTML = animationClips.map(clip => `<option value="${esc(clip.id)}">${esc(clip.name || clip.id)} · ${formatAnimationTime(clip.duration)} · 独立片段</option>`).join('');
-  const action = currentAction();
-  if (action && animationClips.some(c => c.id === action.clipId)) playback.select(action.clipId);
-  renderActionChoices();
-  const known = actionsFor(item),
-    unavailable = known.length ? relatedResources(item, 'animation').filter(r => !known.some(a => a.sourceClipId === r.sourceId)).map(r => ({
-      sourceClipId: r.sourceId,
-      name: r.name,
-      reason: '尚未转换或验证，仅保留源引用。'
-    })) : animationData?.unsupportedClips || [];
-  $('#animation-limitations').hidden = !unavailable.length;
-  $('#animation-limitations').innerHTML = unavailable.length ? `<summary>其余 ${unavailable.length} 个关联动作为什么暂不可播</summary><ul>${unavailable.map(clip => `<li><strong>${esc(clip.name || clip.sourceClipId)}</strong>：${esc(clip.reason || '目标或曲线未验证')}</li>`).join('')}</ul>` : '';
-  const warnings = viewerA?.getAnimationDiagnostics?.() || viewerA?.animationWarnings || [];
-  const limitations = [...(record?.limitations || []), ...warnings.filter(warning => !unavailable.some(clip => clip.sourceClipId === warning.clipId || clip.sourceClipId === warning.sourceClipId)).map(warning => warning.reason || String(warning))];
-  $('#animation-overall-limitations').hidden = !limitations.length;
-  $('#animation-overall-limitations-text').textContent = limitations.join('；');
-  $('#animation-status').textContent = animationClips.length ? record?.evaluation === 'source_constraint_baked' ? `${animationClips.length} 个独立片段 · 离线约束重建，非 Unity 实际运行。事件 / 特效未执行。` : `${animationClips.length} 个独立片段 · 原始轨道，缺 IK。非完整流程；事件 / 特效未执行。` : record ? '本物件的曲线或目标节点尚不足以安全播放，保留元数据，不生成替代动作。' + limitations.join('；') : $('#animation-status').textContent;
-  if (!preserved && (animationClips.find(c => c.id === playback.getState().clipId)?.duration || Infinity) < 0.2) playback.setSpeed(0.1);
-  if (preserved && animationClips.some(clip => clip.id === preserved.clipId)) {
-    playback.select(preserved.clipId);
-    playback.setSpeed(preserved.speed);
-    playback.setLoopMode(preserved.loopMode || 'source');
-    playback.seek(preserved.time);
-    if (preserved.playing && preserved.resumeEpoch === animationPauseEpoch && !document.hidden) playback.play();
+  $('#animation-controls').hidden=!animationClips.length;
+  $('#animation-panel').hidden=!animationClips.length&&!record&&!relatedResources(item,'animation').length;
+  $('#animation-clip').disabled=false;
+  $('#animation-clip').innerHTML=animationClips.map(clip=>`<option value="${esc(clip.id)}">${esc(clip.name||clip.id)} · ${formatAnimationTime(clip.duration)}</option>`).join('');
+  const unavailable=animationData?.unsupportedClips||[];
+  $('#animation-limitations').hidden=!unavailable.length;
+  $('#animation-limitations').innerHTML=unavailable.length?`<summary>未支持的片段</summary><ul>${unavailable.map(clip=>`<li>${esc(clip.name||clip.sourceClipId)}：${esc(clip.reason||'曲线未验证')}</li>`).join('')}</ul>`:'';
+  const warnings=viewerA?.getAnimationDiagnostics?.()||[],limitations=[...(record?.limitations||[]),...warnings.map(w=>w.reason||String(w))];
+  $('#animation-overall-limitations').hidden=!limitations.length;
+  $('#animation-overall-limitations-text').textContent=limitations.join('；');
+  $('#animation-status').textContent=animationClips.length?`${animationClips.length} 个独立已验证片段；不执行脚本、事件或物理。`:record?'绑定或曲线验证未通过，保留静态预览。'+limitations.join('；'):$('#animation-status').textContent;
+  if(preserved&&animationClips.some(clip=>clip.id===preserved.clipId)) {
+    playback.select(preserved.clipId);playback.setSpeed(preserved.speed);playback.setLoopMode(preserved.loopMode||'source');playback.seek(preserved.time);
+    if(preserved.playing&&preserved.resumeEpoch===animationPauseEpoch&&!document.hidden)playback.play();
   }
   updateAnimationControls(playback.getState());
-  if (action) {
-    const count = known.filter(a => a.classification === 'source_clip').length,
-      poses = known.filter(a => a.classification === 'static_pose').length;
-    $('#animation-status').textContent = `${count} 个源动作${poses ? ' / ' + poses + ' 个静态姿势' : ''} · ${action.classification === 'derived_source_state_flow' ? '12 段源状态流程，30 条装弹事件仅注释' : '当前：' + actionRole(action)}。非 Unity 实际运行。`;
-    $('#animation-evidence-link').href = action.evidenceUrl || selectedAnimationRecord(item).metadataUrl;
-    $('#animation-evidence-link').hidden = false;
-  } else $('#animation-evidence-link').hidden = true;
-  for (const button of $$('#object-relations [data-related]')) {
-    const resource = resourceMap.get(button.dataset.related);
-    if (resource?.type !== 'animation') continue;
-    const linked = known.find(a => a.sourceClipId === resource.sourceId),
-      clip = animationClips.find(c => c.sourceId === resource.sourceId);
-    if (linked) {
-      button.innerHTML = (linked.classification === 'static_pose' ? '◇ ' : '▶ ') + esc(resource.name) + `<small>${formatAnimationTime(linked.duration)} · ${esc(actionRole(linked))}</small>`;
-      button.classList.add('animation-playable');
-      button.title = '在固定模型区查看，不会滚走预览';
-      button.onclick = () => selectAction(linked.id, true);
-    } else if (clip) {
-      button.onclick = () => selectPlayableClip(clip.id, true);
-    }
+  $('#animation-evidence-link').hidden=!record?.metadataUrl;
+  if(record?.metadataUrl)$('#animation-evidence-link').href=record.metadataUrl;
+  for(const button of $$('#object-relations [data-related]')) {
+    const resource=resourceMap.get(button.dataset.related),clip=animationClips.find(c=>c.sourceId===resource?.sourceId);
+    if(resource?.type==='animation'&&clip)button.onclick=()=>selectPlayableClip(clip.id,true);
   }
 }
 function selectPlayableClip(id, autoplay = false) {
@@ -993,7 +794,6 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
       profile: viewerProfile(profileById(profileA)),
       modelAsset: rendered.modelAsset,
       resourceBaseUrl: rendered.resourceBaseUrl,
-      materialRules,
       signal: abort.signal,
       camera: previousCamera,
       animationData,
@@ -1009,8 +809,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
         profile: viewerProfile(profileById(profileB)),
         modelAsset: rendered.modelAsset,
         resourceBaseUrl: rendered.resourceBaseUrl,
-        materialRules,
-        signal: abort.signal,
+          signal: abort.signal,
         camera: a.getCamera?.(),
         animationData,
         onCameraChange: camera => syncCamera(camera, 'b')
@@ -1022,7 +821,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
       viewerB = b;
     }
     bindAnimationControls(item, animationRecord, preserved, animationData);
-    if (animationClips.length) $('#preview-disclaimer').textContent = '几何、材质与动作来自可验证的源引用。当前模式只播放已验证的原始轨道或离线约束派生结果，不是 Unity 实际运行；未重现游戏脚本、粒子、音效、事件、动态风或完整 Unity Animator。';
+    if (animationClips.length) $('#preview-disclaimer').textContent = '当前仅播放通过目录门禁及节点绑定校验的 glTF 坐标动画侧车；不执行脚本、事件、物理或原工程运行时。';
     $('#preview-caption').textContent = (currentVariant?.label ? currentVariant.label + ' · ' : '') + (comparison ? '双视图联动机位与动作时间 · 拖动旋转 · 滚轮缩放' : '拖动旋转 · 滚轮缩放' + (config.renderer.compare === false ? '' : ' · 可开启同机位对比'));
   } catch (error) {
     if (request !== viewerRequest) return;
@@ -1059,13 +858,9 @@ async function openDetail(item) {
   variants.hidden = !(item.variants || []).length;
   variants.innerHTML = (item.variants || []).map(v => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join('');
   variants.value = currentVariant?.id || '';
-  const library = actionLibrary.get(item.id),
-    ready = actionsFor(item);
-  activeActionId = ready.find(a => a.id === library?.defaultActionId)?.id || ready.find(a => a.recommended)?.id || ready[0]?.id || null;
-  actionGroup = 'recommended';
   profileA = defaultProfile;
   if (profileB === profileA) {
-    profileB = profiles.find(profile => profile.implemented && profile.id === 'hamsters_away' && profile.id !== profileA)?.id || profiles.find(profile => profile.implemented && profile.id !== profileA)?.id || profileA;
+    profileB = profiles.find(profile => availableProfile(profile) && profile.id !== profileA)?.id || profileA;
     $('#profile-b').value = profileB;
   }
   $('#profile-a').value = profileA;
@@ -1084,22 +879,12 @@ async function openDetail(item) {
   $('#object-relations').innerHTML = relationsHTML(item);
   $('#object-relations').hidden = !item.isObject;
   $$('[data-related]').forEach(button => button.onclick = () => openResource(resourceMap.get(button.dataset.related)));
-  $$('[data-object-related]').forEach(button => button.onclick = () => {
-    const related = itemMap.get(button.dataset.objectRelated);
-    if (related?.isObject) openDetail(related);
-  });
   $('#comment').value = reviewOf(item).comment || '';
   updateReviewButtons();
   $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
-  $('#preview-disclaimer').textContent = item.isObject ? '按原始 renderer → material → texture 引用组合，不靠同名猜配。贴图、透明裁切与支持的材质参数可显示；游戏脚本、风、粒子与原 Unity 光照未重现。动画只在验证通过时提供播放器。' : item.type === 'program' ? '这是反编译重建的 C# 文本，不是原始项目源码。只做静态阅读，未执行原 DLL/EXE。' : item.type === 'animation' ? '这是动画元数据，不提供播放，不虚构与完整物件的绑定。' : item.type === 'material' ? '关联贴图仅用于溯源，不是材质球渲染。请在完整物件里查看材质与几何组合。' : '当前是独立技术资源；独立白模不包含完整原材质组合。项目渲染模式仅用于光照检视，完整效果请回到“完整物件”。';
+  $('#preview-disclaimer').textContent = item.isObject ? '显示目录声明的模型、材质和图像关系；不凭名称猜配，不执行源项目。动画仅在验证通过后提供播放器。' : item.type === 'animation' ? '这是动画元数据，不提供播放，不虚构与完整物件的绑定。' : item.type === 'material' ? '关联贴图仅用于溯源，不是材质球渲染。请在完整物件里查看材质与几何组合。' : '当前是独立技术资源；独立白模不包含完整原材质组合。项目渲染模式仅用于光照检视，完整效果请回到“完整物件”。';
   $('#assembly-evidence').hidden = !item.isObject;
   $('#assembly-evidence').innerHTML = item.isObject ? `<strong>${esc(item.assemblyStatusLabel || item.assemblyStatus || '有来源的整体，不是碎片拼贴')}</strong>${esc(item.description || '几何、层级变换、材质槽与贴图引用保留来源关系。')}${item.sourceCoverage ? '<br>' + esc(coverageText(item)) : ''}` : '';
-  if (item.isObject && neutralFallbacks(item).length) {
-    const warning = document.createElement('p');
-    warning.className = 'source-fallback-warning';
-    warning.textContent = '未实现的程序化材质以中性颜色显示：' + neutralFallbacks(item).map(material => material.name).join('、') + '。这部分不代表原游戏外观。';
-    $('#assembly-evidence').append(warning);
-  }
   if (item.displayWarning) {
     const warning = document.createElement('p');
     warning.className = 'source-fallback-warning';
@@ -1243,6 +1028,7 @@ function resetFilters() {
     review: 'all',
     preview: 'all',
     animation: 'all',
+    semantic: {},
     facets: {
       ...(config.defaultFacets || {})
     },
@@ -1291,8 +1077,7 @@ function exportJSON(all = false) {
     selected: [...selected],
     reviews: Object.fromEntries(Object.entries(reviews).filter(([id]) => all || selected.has(id))),
     ...(config.compactExports ? {
-      animationPreviewRecords: [...animationRecords.values()],
-      actionLibraryRecords: [...actionLibrary.values()]
+      animationPreviewRecords: [...animationRecords.values()]
     } : {}),
     assetMetadataOnly: true,
     assets: exportAssetIndex(subset)
@@ -1491,17 +1276,14 @@ document.addEventListener('keydown', event => {
     $('#search').focus();
   }
 });
-$('#animation-mode').onchange = event => changeAnimationMode(event.target.value);
 $('#animation-stop').onclick = () => {
   pausePlayback();
   playback.seek(0);
 };
 $('#animation-toggle').onclick = () => {
-  if (actionGroup === 'references' || currentAction()?.classification === 'static_pose') return;
   if (playback.getState().playing) pausePlayback();else playback.play();
 };
-$('#animation-clip').onchange = event => actionsFor(current).length ? selectAction(event.target.value, false) : selectPlayableClip(event.target.value);
-$('#animation-library').onchange = event => changeActionGroup(event.target.value);
+$('#animation-clip').onchange = event => selectPlayableClip(event.target.value);
 $('#animation-repeat').onchange = event => playback.setLoopMode(event.target.value);
 $('#animation-seek').oninput = event => playback.seek(Number(event.target.value) / 1000 * playback.getState().duration);
 $('#animation-speed').onchange = event => playback.setSpeed(event.target.value);
@@ -1518,6 +1300,7 @@ document.addEventListener('visibilitychange', () => {
   } else if (!$('#detail-modal').open) scheduleCardPreviews();
 });
 window.addEventListener('pagehide', () => {
+  semanticUI?.cancelPending?.();
   ++restoreGeneration;
   resourceScope.invalidate();
   resourceAbort?.abort();
@@ -1664,7 +1447,6 @@ function scheduleCardPreviews() {
     }
     previewQueue.request(thumbnailKey(item, id), item.modelUrl, {
       profile,
-      materialRules,
       modelAsset: item.modelAsset,
       resourceBaseUrl: item.resourceBaseUrl
     }, result => {
@@ -1672,7 +1454,7 @@ function scheduleCardPreviews() {
       if (result.status === 'ready') {
         image.src = result.url;
         image.alt = item.name + ' · ' + title;
-        label.textContent = title + (canopyRuleNote(item, id) ? ' · 树冠统一色' : '');
+        label.textContent = title;
         label.className = 'render-preview-state ready';
       } else {
         label.textContent = '此模式缩略图生成失败 · 当前为源缩略图';
@@ -1704,16 +1486,6 @@ if (config.capabilities.animationFilters) $('#animation-filter').onchange = even
   state.page = 1;
   render();
 };
-if (config.capabilities.research) $('#research-btn').onclick = () => $('#research-modal').showModal();
-if (config.capabilities.weaponSpotlight) {
-  $('#weapons-btn').onclick = focusWeapons;
-  $('#filter-weapons').onclick = focusWeapons;
-  $('#open-featured-weapon').onclick = () => {
-    const item = objects.find(a => a.category === 'weapons' && a.modelUrl);
-    if (item) openDetail(item);else focusWeapons();
-  };
-}
-if (config.capabilities.effects) for (const id of ['#weapon-effects-btn', '#open-effect-evidence']) $(id).onclick = () => $('#weapon-effects-modal').showModal();
 function invalidatePreviews() {
   thumbnailObserver?.disconnect();
   thumbnailEpoch++;
@@ -1856,6 +1628,8 @@ function changeDataset(id) {
   thumbnailEpoch++;
   if ($('#detail-modal').open) $('#detail-modal').close();
   config.datasetId = id;
+  state.semantic = {};
+  configureSemanticUI();
   for (const key of ['source', 'type', 'librarySource']) state.facets[key] = 'all';
   state.facets.libraryDataset = id;
   state.view = 'technical';
