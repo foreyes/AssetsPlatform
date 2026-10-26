@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "objects": [
+    {
+      "id": "object-synthetic-linear",
+      "sourceId": "synthetic:linear-translation:object",
+      "name": "自制平移矩形",
+      "category": "synthetic",
+      "modelUrl": "assets/linear-translation.glb",
+      "assetId": "mesh-synthetic-linear",
+      "description": "双节点刚性矩形；合成动画证据未经过浏览器 GPU 复验。"
+    }
+  ]
+}

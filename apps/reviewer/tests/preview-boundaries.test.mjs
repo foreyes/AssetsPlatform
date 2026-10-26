@@ -10,6 +10,10 @@ const binStart=20+source.readUInt32LE(12),bin=source.subarray(binStart+8);
 function model(change){const json=structuredClone(original);change(json);let text=Buffer.from(JSON.stringify(json));text=Buffer.concat([text,Buffer.alloc((4-text.length%4)%4,32)]);const out=Buffer.alloc(28+text.length+bin.length);out.writeUInt32LE(0x46546c67);out.writeUInt32LE(2,4);out.writeUInt32LE(out.length,8);out.writeUInt32LE(text.length,12);out.writeUInt32LE(0x4e4f534a,16);text.copy(out,20);out.writeUInt32LE(bin.length,20+text.length);out.writeUInt32LE(0x004e4942,24+text.length);bin.copy(out,28+text.length);return out;}
 function png(w,h){const b=Buffer.alloc(24);b.writeUInt32BE(0x89504e47);b.writeUInt32BE(0x0d0a1a0a,4);b.writeUInt32BE(13,8);b.writeUInt32BE(0x49484452,12);b.writeUInt32BE(w,16);b.writeUInt32BE(h,20);return b;}
 test('real packaged cube remains parseable',()=>assert(parseGLB(source).primitives.length>0));
+test('unconverted source-engine visibility and renderer hints are rejected',()=>{
+ assert.throws(()=>parseGLB(model(j=>{j.nodes[0].extras={sourceActive:false};})),/未转换的源引擎/);
+ assert.throws(()=>parseGLB(model(j=>{j.meshes[0].extras={rendererType:'SkinnedMeshRenderer'};})),/未转换的源引擎/);
+});
 test('every unknown required extension fails closed',()=>{for(const ext of ['UNKNOWN_required','KHR_draco_mesh_compression','EXT_meshopt_compression'])assert.throws(()=>parseGLB(model(j=>j.extensionsRequired=[ext])),/Unsupported required extension/);});
 test('unknown optional extension is disclosed',()=>assert(parseGLB(model(j=>j.extensionsUsed=['UNKNOWN_optional'])).warnings.includes('Unsupported optional extension: UNKNOWN_optional')));
 test('required implemented unlit material remains supported',()=>assert(parseGLB(model(j=>j.extensionsRequired=['KHR_materials_unlit'])).primitives.length));

@@ -56,12 +56,12 @@ export function createWorkbench(config) {
     return items.reduce((out, a) => (out[a.type] = (out[a.type] || 0) + 1, out), Object.create(null));
   }
   function availableProfile(profile) {
-    return profile && profile.implemented !== false && profile.available !== false && !['unavailable', 'not-implemented', 'unsupported', 'planned'].includes(profile.status) && ['material', 'clay', 'toon', 'source', 'unlit', 'lit', 'banded', 'cozy', 'hamster'].includes(profile.mode || profile.id);
+    return profile && profile.implemented !== false && profile.available !== false && !['unavailable', 'not-implemented', 'unsupported', 'planned'].includes(profile.status) && ['material', 'clay', 'toon'].includes(profile.mode || profile.id);
   }
   const RENDER_PREFERENCE_KEY = config.renderPreferenceKey;
   function validDefaultProfile(value, profiles) {
-    const fallback = profiles.find(profile => profile.id === config.defaultProfile && profile.implemented)?.id || profiles.find(profile => profile.implemented)?.id || 'material';
-    return typeof value === 'string' && profiles.some(profile => profile.id === value && profile.implemented) ? value : fallback;
+    const fallback = profiles.find(profile => profile.id === config.defaultProfile && availableProfile(profile))?.id || profiles.find(availableProfile)?.id || 'material';
+    return typeof value === 'string' && profiles.some(profile => profile.id === value && availableProfile(profile)) ? value : fallback;
   }
   function readDefaultProfile(storage, profiles) {
     try {

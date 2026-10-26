@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "id": "mesh-synthetic-linear",
+      "name": "自制平移矩形网格",
+      "type": "mesh",
+      "category": "synthetic",
+      "modelUrl": "assets/linear-translation.glb"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
-// glTF 2.0 material viewer. Source-verified curves and true linear-blend skins are opt-in.
-// Skin evaluation follows Khronos glTF 2.0 §3.7.3; no Unity runtime IK is fabricated.
+// Bounded glTF 2.0 material viewer. Sidecar animation requires separate evidence.
+// Skin evaluation follows Khronos glTF 2.0 §3.7.3.
 // No libraries, original game code, or external services.
-// Lighting profiles are browser approximations, never the original Unity shaders.
+// Lighting profiles are browser approximations, not source-engine shaders.
 // Deliberately bounded preview subset, not a complete glTF implementation. Per model.
 export const PREVIEW_LIMITS=Object.freeze({downloadBytes:64*1024*1024,jsonBytes:8*1024*1024,accessorValues:8*1024*1024,nodes:4096,depth:128,materials:2048,images:128,imageBytes:32*1024*1024,imagePixels:32*1024*1024,imageDimension:8192,primitives:4096,vertices:1000000,indices:3000000});
 // Only these required semantics are implemented; optional unknown semantics warn.
@@ -127,6 +127,9 @@ export function parseGLB(input) {
   for(const [key,max] of Object.entries({nodes:PREVIEW_LIMITS.nodes,materials:PREVIEW_LIMITS.materials,images:PREVIEW_LIMITS.images,meshes:4096,accessors:16384,bufferViews:16384,textures:4096,skins:1024,animations:1024,scenes:1024,samplers:4096})){
     if(json[key]!==undefined&&!Array.isArray(json[key]))throw Error('Invalid model collection: '+key);budget((json[key]||[]).length,max,key);
   }
+  // These source-engine hints change geometry/visibility semantics outside glTF.
+  // Reject rather than silently drawing a misleading rigid or visible fallback.
+  if((json.nodes||[]).some(node=>Object.hasOwn(node.extras||{},'sourceActive'))||(json.meshes||[]).some(mesh=>Object.hasOwn(mesh.extras||{},'rendererType')))throw Error('模型包含未转换的源引擎可见性或渲染器类型');
   let imageBytes=0,imagePixels=0,vertexTotal=0,indexTotal=0,primitiveTotal=0;
   const dimensions={SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT2:4,MAT3:9,MAT4:16};
   const componentSizes={5120:1,5121:1,5122:2,5123:2,5125:4,5126:4};
@@ -189,7 +192,7 @@ export function parseGLB(input) {
   });
   const textures=(json.textures||[]).map(texture=>({source:texture.source,sampler:json.samplers?.[texture.sampler]||{}}));
   let nodeVisits=0;
-  const instances=[],nodeWorlds=new Map(),nodeParents=new Map(),nodeVisibility=new Map();
+  const instances=[],nodeWorlds=new Map(),nodeParents=new Map();
   function visit(index,parent,ancestors=new Set(),parentIndex=null) {
     budget(++nodeVisits,PREVIEW_LIMITS.nodes,'node visits');
     budget(ancestors.size,PREVIEW_LIMITS.depth,'node depth');
@@ -199,9 +202,8 @@ export function parseGLB(input) {
     if(local.length!==16||!local.every(Number.isFinite)) throw Error('模型节点变换无效');
     if(nodeWorlds.has(index)) throw Error('模型节点有多个父层级');
     const world=multiply(parent,local),next=new Set(ancestors);next.add(index);nodeWorlds.set(index,world);nodeParents.set(index,parentIndex);
-    const visible=node.extras?.sourceActive!==false&&(parentIndex===null||nodeVisibility.get(parentIndex)!==false);nodeVisibility.set(index,visible);
-    if(node.mesh!==undefined) instances.push({mesh:node.mesh,world,node,index,visible});
-    if(node.skin!==undefined) warnings.push('源关节、权重与逆绑定矩阵驱动蒙皮；不执行 Unity IK/脚本');
+    if(node.mesh!==undefined) instances.push({mesh:node.mesh,world,node,index});
+    if(node.skin!==undefined) warnings.push('关节、权重与逆绑定矩阵驱动蒙皮；不执行额外的运行时约束或脚本');
     for(const child of node.children||[]) visit(child,world,next,index);
   }
   const scene=json.scenes?.[json.scene??0];
@@ -241,7 +243,7 @@ export function parseGLB(input) {
   for(const instance of instances) {
     const mesh=json.meshes?.[instance.mesh];if(!mesh) throw Error('模型网格引用无效');
     const nm=normalMatrix(instance.world);
-    for(const [sourcePrimitiveIndex,primitive] of (mesh.primitives||[]).entries()) {
+    for(const primitive of mesh.primitives||[]) {
       budget(++primitiveTotal,PREVIEW_LIMITS.primitives,'instanced primitives');
       const mode=primitive.mode??4;
       if(![4,5,6].includes(mode)){warnings.push('点或线拓扑未显示');continue;}
@@ -290,10 +292,9 @@ export function parseGLB(input) {
       const material=primitive.material===undefined?fallback:materials[primitive.material];if(!material) throw Error('模型材质引用无效');
       for(const info of [material.baseColorTexture,material.emissiveTexture,material.metallicRoughnessTexture]) if(info&&info.texCoord!==0) warnings.push('当前仅支持 UV0，其他 UV 通道的贴图未应用');
       if(material.source.normalTexture) warnings.push('法线贴图暂未应用；保留模型源法线');
-      for(const index of indices) for(let axis=0;axis<3;axis++) {const v=positions[index*3+axis];if(!Number.isFinite(v))throw Error('节点变换产生无效位置');if(instance.visible!==false){min[axis]=Math.min(min[axis],v);max[axis]=Math.max(max[axis],v);}}
-      restPrimitives.push({nodeIndex:instance.index,localPositions:pos.data,localNormals,localIndices,rendererType:mesh.extras?.rendererType||null,skin:instance.node.skin,skinData,morph:!!primitive.targets?.length});
-      primitives.push({positions,normals,uv,colors,indices:new Uint32Array(indices),visible:instance.visible!==false,material,nodeName:instance.node.name||mesh.name||'',nodeIndex:instance.index,extras:primitive.extras||{},sourceAttributes:Object.keys(attr),
-        sourceMeshId:mesh.extras?.sourceId||null,sourceMeshSha256:mesh.extras?.sourceObjectSha256||null,sourcePrimitiveIndex,sourcePrimitiveMode:mode});
+      for(const index of indices) for(let axis=0;axis<3;axis++) {const v=positions[index*3+axis];if(!Number.isFinite(v))throw Error('节点变换产生无效位置');min[axis]=Math.min(min[axis],v);max[axis]=Math.max(max[axis],v);}
+      restPrimitives.push({nodeIndex:instance.index,localPositions:pos.data,localNormals,localIndices,skin:instance.node.skin,skinData,morph:!!primitive.targets?.length});
+      primitives.push({positions,normals,uv,colors,indices:new Uint32Array(indices),visible:true,material,nodeName:instance.node.name||mesh.name||'',nodeIndex:instance.index,extras:primitive.extras||{},sourceAttributes:Object.keys(attr)});
     }
   }
   if(!primitives.length||!min.every(Number.isFinite)) throw Error('模型没有可绘制的三角形');
@@ -319,7 +320,7 @@ export async function loadGeometry(source,{signal}={}) {
 
 // Sidecars are data, never executable animation/controller scripts. Binding is by
 // source object identity AND GLB index; names and hierarchy-path guesses are banned.
-const trackDimensions={translation:3,rotation:4,scale:3,active:1};
+const trackDimensions={translation:3,rotation:4,scale:3};
 function numericArray(value,length,label) {
   if(!Array.isArray(value)||value.length!==length||!value.every(Number.isFinite))throw Error(label+' 含无效数值');
   return value.slice();
@@ -342,55 +343,8 @@ function keyValues(value,count,dimension,label) {
   const flat=numericArray(value,count*dimension,label);
   return Array.from({length:count},(_,i)=>flat.slice(i*dimension,(i+1)*dimension));
 }
-// Exact decoded Unity source scalar functions. No hand-authored motion or
-// resampled glTF channels are substituted for these streamed/dense/constants.
-export function sampleCanonicalScalar(curve,time) {
-  if(curve.storage==='constant')return curve.value;
-  if(curve.storage==='dense'){
-    const x=clamp((time-curve.beginTime)*curve.sampleRate,0,curve.samples.length-1),i=Math.floor(x),j=Math.min(i+1,curve.samples.length-1),u=x-i;
-    return curve.samples[i]*(1-u)+curve.samples[j]*u;
-  }
-  const keys=curve.keys;let lo=0,hi=keys.length;
-  while(lo+1<hi){const mid=(lo+hi)>>1;if(keys[mid].time<=time)lo=mid;else hi=mid;}
-  const key=keys[lo],dt=Math.max(0,time-key.time),[a,b,c,d]=key.coeff;
-  return ((a*dt+b)*dt+c)*dt+d;
-}
-function validateCanonicalScalar(curve){
-  if(!curve||typeof curve!=='object')throw Error('源标量曲线缺失');
-  if(curve.storage==='constant'){if(!Number.isFinite(curve.value))throw Error('源常量曲线无效');}
-  else if(curve.storage==='dense'){if(!Number.isFinite(curve.beginTime)||!Number.isFinite(curve.sampleRate)||curve.sampleRate<=0||!Array.isArray(curve.samples)||!curve.samples.length||curve.samples.length>1000000||!curve.samples.every(Number.isFinite))throw Error('源密集曲线无效');}
-  else if(curve.storage==='streamed'){if(!Array.isArray(curve.keys)||!curve.keys.length||curve.keys.length>1000000)throw Error('源流式曲线缺失');for(let i=0;i<curve.keys.length;i++){const key=curve.keys[i];if(!Number.isFinite(key.time)||i&&key.time<=curve.keys[i-1].time)throw Error('源流式曲线时间无效');numericArray(key.coeff,4,'源三次多项式系数');}}
-  else throw Error('不支持的源曲线存储类型');
-}
-function multiplyQuaternion(a,b){const[x,y,z,w]=a,[X,Y,Z,W]=b;return[w*X+x*W+y*Z-z*Y,w*Y-x*Z+y*W+z*X,w*Z+x*Y-y*X+z*W,w*W-x*X-y*Y-z*Z];}
-export function sampleCanonicalTrack(track,time){
-  const value=track.scalarCurves.map(c=>sampleCanonicalScalar(c,time+(track.sourceStartTime||0)));
-  if(!value.every(Number.isFinite))throw Error('源曲线采样产生无效数值');
-  if(track.sourceProperty==='translation')value[0]*=-1;
-  if(track.sourceProperty==='eulerZXY'){
-    const[x,y,z]=value.map(v=>v*Math.PI/360);
-    const q=multiplyQuaternion(multiplyQuaternion([0,Math.sin(y),0,Math.cos(y)],[Math.sin(x),0,0,Math.cos(x)]),[0,0,Math.sin(z),Math.cos(z)]);
-    return quaternion([q[0],-q[1],-q[2],q[3]]);
-  }
-  if(track.sourceProperty==='rotation')return quaternion([value[0],-value[1],-value[2],value[3]]);
-  return value;
-}
-function compileCanonicalTrack(track,duration,binding){
-  const widths={translation:3,rotation:4,scale:3,eulerZXY:3},width=widths[track.sourceProperty];
-  if(!width||track.path!==(track.sourceProperty==='eulerZXY'?'rotation':track.sourceProperty)||!Array.isArray(track.scalarCurves)||track.scalarCurves.length!==width||!Number.isFinite(track.sourceStartTime))throw Error('源曲线属性或标量绑定无效');
-  track.scalarCurves.forEach(validateCanonicalScalar);
-  const times=new Set([0,duration]);
-  for(const curve of track.scalarCurves){
-    const raw=curve.storage==='streamed'?curve.keys.map(k=>k.time):curve.storage==='dense'?curve.samples.map((_,i)=>curve.beginTime+i/curve.sampleRate):[];
-    for(const t of raw){const local=t-track.sourceStartTime;if(local>0&&local<duration)times.add(local);}
-  }
-  const result={...track,nodeIndex:binding.index,dimension:trackDimensions[track.path],times:[...times].sort((a,b)=>a-b)};
-  for(const t of result.times)sampleCanonicalTrack(result,t);
-  return result;
-}
-
 function compileTrack(track,duration,binding) {
-  if(track.interpolation==='UNITY_CANONICAL')return compileCanonicalTrack(track,duration,binding);
+  if(track.scalarCurves!==undefined||track.sourceProperty!==undefined||track.sourceStartTime!==undefined||track.reconstruction!==undefined)throw Error('公开预览不支持未转换的源引擎曲线');
   const dimension=trackDimensions[track.path];
   if(!dimension)throw Error('不支持的源动画属性：'+String(track.path));
   const interpolation=track.interpolation;
@@ -400,7 +354,6 @@ function compileTrack(track,duration,binding) {
   if(times.some((t,i)=>t<0||t>duration+1e-5||(i>0&&t<=times[i-1])))throw Error('关键帧时间顺序或范围无效');
   const values=keyValues(track.values,times.length,dimension,'关键帧值');
   if(track.path==='rotation')for(const value of values)quaternion(value);
-  if(track.path==='active'&&(interpolation!=='STEP'||values.some(value=>value[0]!==0&&value[0]!==1)))throw Error('启用状态必须是源 0/1 阶跃曲线');
   const result={...track,nodeIndex:binding.index,dimension,interpolation,times,values};
   if(interpolation==='CUBICSPLINE') {
     result.inTangents=keyValues(track.inTangents,times.length,dimension,'入切线');
@@ -409,7 +362,6 @@ function compileTrack(track,duration,binding) {
   return result;
 }
 function sampleTrack(track,time) {
-  if(track.interpolation==='UNITY_CANONICAL')return sampleCanonicalTrack(track,time);
   const {times,values,interpolation,path}=track,last=times.length-1;
   let result;
   if(time<=times[0])result=values[0].slice();
@@ -447,7 +399,7 @@ function includeVisibleTriangleBounds(primitive,min,max) {
 // It never mutates parseGLB's rest geometry or changes normalization per frame.
 export function createSourceAnimation(geometry,data) {
   const source=geometrySources.get(geometry),diagnostics=[],compiled=new Map(),bindings=new Map();
-  const info=geometry.extras?.provenance,sourceId=geometry.extras?.sourceId||source?.nodes[0]?.extras?.sourceId||(info?.sourceFile+':'+info?.pathId);
+  const sourceId=geometry.extras?.sourceId||source?.nodes[0]?.extras?.sourceId;
   let live=null,state=null,lastWorlds=null;const framingCache=new Map();
   const fail=(clipId,reason)=>diagnostics.push({clipId:clipId||null,reason});
   if(data) {
@@ -455,8 +407,10 @@ export function createSourceAnimation(geometry,data) {
       if(!source||![1,2].includes(data.schemaVersion)||data.coordinateSystem!=='glTF')throw Error('动画数据版本或坐标系未经验证');
       if(typeof data.sourceId!=='string'||data.sourceId!==sourceId)throw Error('动画与模型的源对象 ID 不匹配');
       if(!Array.isArray(data.nodes)||!Array.isArray(data.clips))throw Error('动画缺少源节点或片段');
+      if(data.flows!==undefined||data.evaluation!==undefined||data.precomputedFraming!==undefined||data.variants!==undefined)throw Error('公开预览不支持源状态流程、离线约束或专用镜头数据');
       const ids=new Set(),indexes=new Set();
       for(const node of data.nodes) {
+        if(node?.sourceActive!==undefined||node?.active!==undefined)throw Error('公开预览不支持未转换的源节点启用状态');
         const index=node.glbNodeIndex,original=source.nodes[index];
         if(typeof node.id!=='string'||ids.has(node.id)||!Number.isSafeInteger(index)||indexes.has(index)||!original||!source.nodeWorlds.has(index)||original.extras?.sourceId!==node.id)throw Error('动画目标与 GLB 源节点绑定不匹配');
         ids.add(node.id);indexes.add(index);
@@ -472,6 +426,7 @@ export function createSourceAnimation(geometry,data) {
       const clipIds=new Set();
       for(const clip of data.clips) {
         try {
+          if(clip.segments!==undefined||clip.previewPreparation!==undefined||clip.canonicalSHA256!==undefined||clip.classification==='derived_source_state_flow')throw Error('公开预览不支持源状态流程或专用预处理片段');
           if(typeof clip.id!=='string'||!clip.id||clipIds.has(clip.id))throw Error('动画片段 ID 缺失或重复');
           clipIds.add(clip.id);
           if(clip.supported===false||clip.status==='unsupported')throw Error(clip.unsupportedReason||'此源片段不支持预览');
@@ -492,59 +447,28 @@ export function createSourceAnimation(geometry,data) {
           if(!affected.size)throw Error('源曲线未绑定到当前已恢复的可见网格');
           for(const pi of affected) {
             const primitive=source.restPrimitives[pi];
-            if((primitive.skin!==undefined||primitive.rendererType==='SkinnedMeshRenderer')&&!primitive.skinData)throw Error('骨骼蒙皮绑定尚未恢复，不能用静态网格冒充动画');
+            if(primitive.skin!==undefined&&!primitive.skinData)throw Error('蒙皮绑定无效，不能用静态网格冒充动画');
             if(primitive.morph)throw Error('形态目标动画尚未恢复');
           }
           compiled.set(clip.id,{...clip,tracks,affected});
         } catch(error){fail(clip.id,error.message);}
       }
-      // Explicit source-state scenarios reference already verified clips. They are
-      // never converted to a blended curve or stretched to an invented duration.
-      for(const flow of data.flows||[]) {
-        try {
-          if(typeof flow.id!=='string'||compiled.has(flow.id)||!Number.isFinite(flow.duration)||flow.duration<=0||!Array.isArray(flow.segments)||!flow.segments.length)throw Error('源状态流程缺少有效阶段');
-          let end=0;const affected=new Set(),segments=[];
-          for(const segment of flow.segments){
-            const child=compiled.get(segment.clipId);
-            if(!child||child.segments||!Number.isFinite(segment.start)||!Number.isFinite(segment.end)||!Number.isFinite(segment.sourceStart)||!Number.isFinite(segment.speed)||segment.speed<=0||segment.end<=segment.start||Math.abs(segment.start-end)>1e-8||segment.sourceStart<0||Math.abs((segment.end-segment.start)*segment.speed+segment.sourceStart-child.duration)>1e-6)throw Error('源状态流程阶段时域或引用不匹配');
-            end=segment.end;segments.push({...segment});for(const pi of child.affected)affected.add(pi);
-          }
-          if(Math.abs(end-flow.duration)>1e-8)throw Error('源状态流程总时域不一致');
-          compiled.set(flow.id,{...flow,segments,tracks:compiled.get(segments[0].clipId).tracks,affected,classification:'derived_source_state_flow'});
-        } catch(error){fail(flow.id,error.message);}
-      }
     } catch(error){compiled.clear();fail(null,error.message);}
   }
   if(Array.isArray(data?.unsupportedClips))for(const clip of data.unsupportedClips)fail(clip.sourceClipId||clip.id,(clip.name?clip.name+'：':'')+(clip.reason||'源片段尚不支持预览'));
-  const clips=[...compiled.values()].map(clip=>({id:clip.id,name:clip.name||clip.id,duration:clip.duration,loop:clip.loop===true,sourceClipId:clip.sourceClipId||clip.id,limitations:Array.isArray(clip.limitations)?clip.limitations.slice():[],...(clip.previewPreparation?{previewPreparation:{...clip.previewPreparation}}:{})}));
+  const clips=[...compiled.values()].map(clip=>({id:clip.id,name:clip.name||clip.id,duration:clip.duration,loop:clip.loop===true,sourceClipId:clip.sourceClipId||clip.id,limitations:Array.isArray(clip.limitations)?clip.limitations.slice():[]}));
   function sample(clipId,time) {
     const clip=compiled.get(clipId);
     if(!clip)throw Error('此动画没有已验证的可播放曲线');
     if(!Number.isFinite(time))throw Error('动画时间必须是有限数值');
     time=clamp(time,0,clip.duration);
-    if(clip.segments){
-      // Right-continuous hard cuts: at each exact boundary the next source
-      // state owns the pose. No float32-adjacent interpolation window.
-      let segment=clip.segments[0],index=0;
-      for(let i=1;i<clip.segments.length;i++)if(time>=clip.segments[i].start){segment=clip.segments[i];index=i;}else break;
-      const child=compiled.get(segment.clipId),local=clamp((time-segment.start)*segment.speed+segment.sourceStart,0,child.duration);
-      const result=sample(segment.clipId,local);state={clipId,time,duration:clip.duration};
-      result.animationEvaluation={...result.animationEvaluation,classification:'derived_source_state_flow',flowId:clipId,segmentIndex:index,segmentClipId:segment.clipId,segmentLocalTime:local,crossBoundaryInterpolation:false,eventsExecuted:false};
-      return result;
-    }
     const poses=new Map();
     for(const track of clip.tracks) {
       let pose=poses.get(track.nodeIndex);
       if(!pose){const rest=bindings.get(track.nodeId).trs;pose={translation:rest.translation.slice(),rotation:rest.rotation.slice(),scale:rest.scale.slice()};poses.set(track.nodeIndex,pose);}
       pose[track.path]=sampleTrack(track,time);
     }
-    const worlds=new Map(),visibility=new Map();
-    function visible(index) {
-      if(visibility.has(index))return visibility.get(index);
-      const parent=source.nodeParents.get(index),active=poses.get(index)?.active;
-      const own=active?active[0]===1:source.nodes[index].extras?.sourceActive!==false;
-      const result=own&&(parent===null||visible(parent));visibility.set(index,result);return result;
-    }
+    const worlds=new Map();
     function world(index) {
       if(worlds.has(index))return worlds.get(index);
       const parent=source.nodeParents.get(index),local=nodeMatrix(poses.get(index)||source.nodes[index]);
@@ -562,7 +486,7 @@ export function createSourceAnimation(geometry,data) {
         continue;
       }
       const matrix=rest.nodeIndex>=0?world(rest.nodeIndex):identity(),nm=normalMatrix(matrix);
-      p.visible=rest.nodeIndex<0||visible(rest.nodeIndex);
+      p.visible=true;
       p.indices.set(rest.localIndices);
       if(!rest.skinData&&nm.det<0)for(let j=0;j<p.indices.length;j+=3)[p.indices[j+1],p.indices[j+2]]=[p.indices[j+2],p.indices[j+1]];
       poseVertices(p.positions,p.normals,rest.localPositions,rest.localNormals,matrix,rest.skinData,rest.skinData?skinPalette(rest.skinData,world):null,center,scale);
@@ -582,28 +506,19 @@ export function createSourceAnimation(geometry,data) {
       p.center=centroid.map(value=>value/p.indices.length);
     }
     lastWorlds=new Map([...source.nodeWorlds.keys()].map(index=>[index,world(index)]));
-    state={clipId,time,duration:clip.duration};live.animationEvaluation={mode:data?.evaluation==='source_constraint_baked'?'source_constraint_baked':clip.tracks.some(t=>t.interpolation==='UNITY_CANONICAL')?'exact-canonical-source-scalars':'source-keyframes',derivedTrackCount:clip.tracks.filter(t=>t.reconstruction==='source_constraint_math').length,offlineSourceConstraintsApplied:data?.evaluation==='source_constraint_baked',trackCount:clip.tracks.length,affectedPrimitives:clip.affected.size,skinnedPrimitives:source.restPrimitives.filter(p=>p.skinData).length,runtimeIK:false,eventsExecuted:false};live.posedBounds=min.every(Number.isFinite)?{min,max}:null;
+    state={clipId,time,duration:clip.duration};live.animationEvaluation={mode:'glTF-sidecar-keyframes',trackCount:clip.tracks.length,affectedPrimitives:clip.affected.size,skinnedPrimitives:source.restPrimitives.filter(p=>p.skinData).length};live.posedBounds=min.every(Number.isFinite)?{min,max}:null;
     return live;
   }
   function getFraming(clipId=clips[0]?.id) {
     const cached=framingCache.get(clipId);if(cached)return {...cached,center:cached.center.slice()};
     const selected=compiled.get(clipId);if(!selected)return {center:[0,0,0],scale:1,sampleCount:0,clipId:null};
-    // Offline source-sweep cache avoids hundreds of skinning frames on modal open.
-    // Bound to the same model and canonical clip; sample three poses before use.
-    const prepared=data?.precomputedFraming?.[clipId];
-    if(prepared&&prepared.modelSHA256===data.modelSHA256&&prepared.canonicalSHA256===selected.canonicalSHA256&&prepared.clipId===clipId&&Array.isArray(prepared.center)&&prepared.center.length===3&&prepared.center.every(Number.isFinite)&&Number.isFinite(prepared.scale)&&prepared.scale>0&&prepared.scale<=1&&Number.isSafeInteger(prepared.sampleCount)&&prepared.sampleCount>0&&prepared.bounds?.min?.length===3&&prepared.bounds?.max?.length===3&&[...prepared.bounds.min,...prepared.bounds.max].every(Number.isFinite)){
-      const previous=state?{...state}:null;let valid=true;
-      for(const time of [0,selected.duration/2,selected.duration]){const b=sample(clipId,time).posedBounds;if(b)for(let k=0;k<3;k++)if(b.min[k]<prepared.bounds.min[k]-1e-5||b.max[k]>prepared.bounds.max[k]+1e-5)valid=false;}
-      if(previous)sample(previous.clipId,previous.time);else state=null;
-      if(valid){const ready={...prepared,center:prepared.center.slice(),precomputed:true};framingCache.set(clipId,ready);return {...ready,center:ready.center.slice()};}
-    }
     const previous=state?{...state}:null,min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];let sampleCount=0,framing;
 
-    // A fixed full-clip frame avoids clipping thrown gift panels or zoom pumping.
-    // Include source key boundaries, their midpoints, and a dense uniform sweep.
+    // A fixed full-clip frame avoids zoom pumping. Include key boundaries,
+    // their midpoints, and a bounded uniform sweep.
     for(const clip of [selected]) {
       const times=new Set([0,clip.duration]);
-      if(clip.segments){for(const segment of clip.segments){times.add(segment.start);times.add(segment.end);times.add(Math.max(segment.start,segment.end-1e-7));for(const track of compiled.get(segment.clipId).tracks)for(const time of track.times){const t=segment.start+(time-segment.sourceStart)/segment.speed;if(t>=segment.start&&t<=segment.end)times.add(t);}}}else for(const track of clip.tracks)for(const time of track.times)times.add(time);
+      for(const track of clip.tracks)for(const time of track.times)times.add(time);
       const steps=Math.min(1200,Math.max(1,Math.ceil(clip.duration*120)));
       for(let i=0;i<=steps;i++)times.add(clip.duration*i/steps);
       const sorted=[...times].sort((a,b)=>a-b);
@@ -625,7 +540,7 @@ export function createSourceAnimation(geometry,data) {
   return {clips,diagnostics,sample,getFraming,getNodeWorldMatrices(){return lastWorlds?new Map([...lastWorlds].map(([k,v])=>[k,v.slice()])):null;},reset(){state=null;return geometry;},getState(){return state?{...state}:null;}};
 }
 
-// A compact linear-light material shader, not a Unity/URP or full PBR implementation.
+// A compact linear-light material shader, not a complete PBR implementation.
 export const VERTEX_SHADER=`
 attribute vec3 aPosition;
 attribute vec3 aNormal;
@@ -678,8 +593,6 @@ uniform float uMetallic;
 uniform float uRoughness;
 uniform float uMode;
 uniform float uUnlit;
-uniform float uFlatCanopy;
-uniform vec3 uCanopyColor;
 uniform float uWire;
 vec3 toLinear(vec3 c) {return mix(c/12.92,pow((c+0.055)/1.055,vec3(2.4)),step(vec3(0.04045),c));}
 vec3 toSRGB(vec3 c) {return mix(c*12.92,1.055*pow(max(c,vec3(0.0)),vec3(1.0/2.4))-0.055,step(vec3(0.0031308),c));}
@@ -692,9 +605,6 @@ void main() {
   if(uAlphaMode>0.5&&uAlphaMode<1.5&&base.a<uAlphaCutoff) discard;
   float alpha=uAlphaMode>1.5?base.a:1.0;
   if(alpha<0.001) discard;
-  // User-requested flat canopy policy: source dominant sRGB, source UV/alpha only.
-  // This is a custom review treatment, not recovered Unity material behavior.
-  if(uMode>1.5&&uFlatCanopy>0.5) {gl_FragColor=vec4(uCanopyColor,clamp(alpha,0.0,1.0));return;}
   vec3 albedo=base.rgb*uBaseTint;
   if(uMode>0.5&&uMode<1.5) albedo=vec3(0.42,0.46,0.43)*uBaseTint;
   vec3 N=normalize(vNormal);
@@ -736,58 +646,6 @@ function prepareProfile(value={}) {
     saturation:clamp(finite(p.saturation,1),0,3),contrast:clamp(finite(p.contrast,1),0,3),
     alphaCutoff:p.alphaCutoff===undefined?null:clamp(finite(p.alphaCutoff,0.5),0,1),unlit:p.unlit===undefined?null:!!p.unlit}};
 }
-// A data-authored allowlist, never inferred from names, shaders, alpha mode, or topology.
-function prepareMaterialRules(rules={}) {
-  const ids=new Set((rules?.flatCanopySourceMaterialIds||[]).filter(id=>typeof id==='string'));
-  const colors=new Map();
-  for(const id of ids) {
-    const value=rules?.dominantColorsSRGB8?.[id];
-    if(Array.isArray(value)&&value.length===3&&value.every(v=>Number.isInteger(v)&&v>=0&&v<=255))colors.set(id,value.map(v=>v/255));
-  }
-  const triangleRules=[];
-  for(const rule of Array.isArray(rules?.flatCanopyTriangleRules)?rules.flatCanopyTriangleRules:[]) {
-    const color=rule?.colorSRGB8,triangles=rule?.triangleIndices,count=rule?.expectedTriangleCount;
-    // Mixed leaf/trunk materials need an independently verified source mesh and
-    // exact triangle list. Invalid, incomplete or whole-slot masks fail closed.
-    if(typeof rule?.sourceMaterialId!=='string'||typeof rule?.sourceMeshId!=='string'||
-      typeof rule?.sourceMeshSha256!=='string'||!/^[a-f0-9]{64}$/.test(rule.sourceMeshSha256)||
-      !Number.isSafeInteger(rule?.primitiveIndex)||rule.primitiveIndex<0||
-      !Number.isSafeInteger(count)||count<2||!Array.isArray(triangles)||!triangles.length||triangles.length>=count||
-      !triangles.every(t=>Number.isSafeInteger(t)&&t>=0&&t<count)||new Set(triangles).size!==triangles.length||
-      !Array.isArray(color)||color.length!==3||!color.every(v=>Number.isInteger(v)&&v>=0&&v<=255))continue;
-    triangleRules.push({...rule,triangles:new Set(triangles),color:color.map(v=>v/255)});
-  }
-  return {ids,colors,triangleRules,modes:new Set(rules?.toonModes||['toon'])};
-}
-function flatCanopyColor(material,rules,profile) {
-  const sourceId=material?.extras?.sourceMaterial?.sourceId;
-  if(profile.mode!=='toon'||!rules.modes.has('toon')||!rules.ids.has(sourceId))return null;
-  return rules.colors.get(sourceId)||null;
-}
-export function isFlatCanopyMaterial(material,rules={},profile={}) {
-  return !!flatCanopyColor(material,prepareMaterialRules(rules),prepareProfile(profile));
-}
-function canopyDrawRanges(primitive,rules,profile) {
-  const count=primitive.indices.length,color=flatCanopyColor(primitive.material,rules,profile);
-  const fallback=[{first:0,count,color}];
-  if(color||profile.mode!=='toon'||!rules.modes.has('toon')||primitive.sourcePrimitiveMode!==4)return fallback;
-  const matches=rules.triangleRules.filter(rule=>rule.sourceMaterialId===primitive.material.extras?.sourceMaterial?.sourceId&&
-    rule.sourceMeshId===primitive.sourceMeshId&&rule.sourceMeshSha256===primitive.sourceMeshSha256&&
-    rule.primitiveIndex===primitive.sourcePrimitiveIndex&&rule.expectedTriangleCount*3===count);
-  // Ambiguous rules must not choose a color by ordering.
-  if(matches.length!==1)return fallback;
-  const rule=matches[0],ranges=[];
-  for(let triangle=0;triangle<count/3;triangle++) {
-    const selected=rule.triangles.has(triangle),previous=ranges[ranges.length-1];
-    if(previous&&!!previous.color===selected)previous.count+=3;
-    else ranges.push({first:triangle*3,count:3,color:selected?rule.color:null});
-  }
-  return ranges;
-}
-// Export the exact draw selection for topology and offscreen-pixel regressions.
-export function getCanopyDrawRanges(primitive,rules={},profile={}) {
-  return canopyDrawRanges(primitive,prepareMaterialRules(rules),prepareProfile(profile));
-}
 function cancelledError(){return new DOMException('预览任务已取消','AbortError');}
 function sanitizeCamera(value={},previous=defaultCamera) {
   return {yaw:finite(value.yaw,previous.yaw),pitch:clamp(finite(value.pitch,previous.pitch),-1.5,1.5),zoom:clamp(finite(value.zoom,previous.zoom),1.25,14)};
@@ -816,7 +674,7 @@ export async function createViewer(container,url,options={}) {
   container.replaceChildren(canvas);
   const abort=new AbortController(),cleanups=[],decodedImages=[];
   let disposed=false,contextLost=false,ready=false,geometry,animation=null,animationFrame={center:[0,0,0],scale:1},gpu=null,resize=null,frame=0,drag=null,isWire=false;
-  let camera=sanitizeCamera(options.camera),profile=prepareProfile(options.profile),materialRules=prepareMaterialRules(options.materialRules);
+  let camera=sanitizeCamera(options.camera),profile=prepareProfile(options.profile);
   const gl=canvas.getContext('webgl',{antialias:true,alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:!!options._sharedResources});
   if(options._sharedResources)options._sharedResources.gl=gl;
   function showStatus(message,afterFailure=false) {
@@ -864,7 +722,6 @@ export async function createViewer(container,url,options={}) {
   function notifyCamera(){if(alive()&&typeof options.onCameraChange==='function')options.onCameraChange({...camera});}
   const api={reset(){if(!disposed){camera={...defaultCamera};requestDraw();notifyCamera();}},wireframe(value){isWire=!!value;requestDraw();},
     setProfile(value){profile=prepareProfile(value);requestDraw();},
-    setMaterialRules(value){materialRules=prepareMaterialRules(value);requestDraw();},
     getAnimationClips(){return animation?.clips.map(clip=>({...clip,limitations:clip.limitations.slice()}))||[];},
     getAnimationState(){return animation?.getState()||null;},
     getAnimationFraming(){return {...animationFrame,center:animationFrame.center.slice()};},
@@ -915,7 +772,7 @@ export async function createViewer(container,url,options={}) {
         if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error('三维着色器链接失败：'+gl.getProgramInfoLog(program));
       }finally{if(vert)gl.deleteShader(vert);if(frag)gl.deleteShader(frag);}
       for(const key of ['aPosition','aNormal','aUV','aColor'])gpu.loc[key]=gl.getAttribLocation(program,key);
-      for(const key of ['uMVP','uModelView','uBaseMap','uEmissiveMap','uMRMap','uBaseUV','uEmissiveUV','uMRUV','uBaseWrap','uEmissiveWrap','uMRWrap','uBaseColor','uEmissive','uLightDirection','uAmbientColor','uKeyColor','uShadowColor','uBaseTint','uAmbient','uKey','uBands','uLightThreshold','uSaturation','uContrast','uAlphaMode','uAlphaCutoff','uMetallic','uRoughness','uMode','uUnlit','uFlatCanopy','uCanopyColor','uWire'])gpu.loc[key]=gl.getUniformLocation(program,key);
+      for(const key of ['uMVP','uModelView','uBaseMap','uEmissiveMap','uMRMap','uBaseUV','uEmissiveUV','uMRUV','uBaseWrap','uEmissiveWrap','uMRWrap','uBaseColor','uEmissive','uLightDirection','uAmbientColor','uKeyColor','uShadowColor','uBaseTint','uAmbient','uKey','uBands','uLightThreshold','uSaturation','uContrast','uAlphaMode','uAlphaCutoff','uMetallic','uRoughness','uMode','uUnlit','uWire'])gpu.loc[key]=gl.getUniformLocation(program,key);
       if(shared){shared.program=program;shared.loc=gpu.loc;}
     }
     function uploadTexture(img,sampler={}) {
@@ -982,12 +839,7 @@ export async function createViewer(container,url,options={}) {
       for(const [unit,info,map,uv,wrap]of [[0,material.baseColorTexture,'uBaseMap','uBaseUV','uBaseWrap'],[1,material.emissiveTexture,'uEmissiveMap','uEmissiveUV','uEmissiveWrap'],[2,material.metallicRoughnessTexture,'uMRMap','uMRUV','uMRWrap']]) {
         const mapTexture=info&&info.texCoord===0?gpu.maps[info.index]||gpu.white:gpu.white;gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,mapTexture.texture);gl.uniform2fv(loc[wrap],mapTexture.wrap);gl.uniform1i(loc[map],unit);gl.uniformMatrix3fv(loc[uv],false,new Float32Array(info?.transform||[1,0,0,0,1,0,0,0,1]));
       }
-      // Preserve the original buffer, winding and triangle order. Only the exact
-      // verified canopy runs change color; the shared material's trunk does not.
-      for(const range of canopyDrawRanges(item.source,materialRules,profile)) {
-        gl.uniform1f(loc.uFlatCanopy,range.color?1:0);gl.uniform3fv(loc.uCanopyColor,range.color||[0,0,0]);
-        gl.drawArrays(gl.TRIANGLES,range.first,range.count);
-      }
+      gl.drawArrays(gl.TRIANGLES,0,item.count);
     }
     gl.depthMask(true);gl.disable(gl.BLEND);
   }
@@ -1043,7 +895,7 @@ export function createThumbnailRenderer({width=360,height=300}={}) {
     const cancel=()=>controller.abort();options.signal?.addEventListener('abort',cancel,{once:true});
     let viewer;
     try {
-      viewer=await createViewer(container,url,{profile:options.profile,materialRules:options.materialRules,camera:options.camera,
+      viewer=await createViewer(container,url,{profile:options.profile,camera:options.camera,
         signal:controller.signal,_canvas:canvas,_sharedResources:shared,_renderSize:size});
       if(disposed||controller.signal.aborted)throw cancelledError();
       return await viewer.capture();

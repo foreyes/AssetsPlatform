@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "objects": [
+    {
+      "objectId": "object-synthetic-linear",
+      "sourceId": "synthetic:linear-translation:object",
+      "status": "pending",
+      "modelUrl": "assets/linear-translation.glb",
+      "dataUrl": "assets/linear-translation.animation.json",
+      "playableClipIds": [
+        "synthetic-linear-1s"
+      ],
+      "verifiedPlayableClipIds": [],
+      "skinBindingVerified": false,
+      "sourceCurvesVerified": false,
+      "pixelVerified": false,
+      "limitations": [
+        "待完成 CPU 数值、绑定与真实 WebGL 复验；不得仅为显示播放按钮更改验证字段。"
+      ]
+    }
+  ]
+}

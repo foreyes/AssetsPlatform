@@ -13,8 +13,14 @@ const directory=JSON.parse(fs.readFileSync(path.join(root,'project-directory.jso
 for(const entry of directory.projects){
  const configPath=path.join(root,entry.config),config=JSON.parse(fs.readFileSync(configPath));assert.equal(config.id,entry.id);
  const assets=path.join(path.dirname(configPath),'assets');
- for(const name of ['catalog.json','objects-catalog.json','render-profiles.json','canopy-rules.json'])assert(fs.existsSync(path.join(assets,name)));
- const b=fs.readFileSync(path.join(assets,'cube.glb'));assert.equal(b.readUInt32LE(0),0x46546c67);assert.equal(b.readUInt32LE(8),b.length);
- const gltf=JSON.parse(b.subarray(20,20+b.readUInt32LE(12)).toString());assert(gltf.buffers.every(b=>!b.uri));assert(!gltf.images?.some(i=>i.uri));
+ for(const name of ['catalog.json','objects-catalog.json','render-profiles.json'])assert(fs.existsSync(path.join(assets,name)));
+ const catalog=JSON.parse(fs.readFileSync(path.join(assets,'catalog.json')));
+ const objects=JSON.parse(fs.readFileSync(path.join(assets,'objects-catalog.json')));
+ const models=[...new Set([...catalog.assets,...objects.objects].map(item=>item.modelUrl).filter(Boolean))];
+ assert(models.length,'project requires a model');
+ for(const model of models){
+  const b=fs.readFileSync(path.join(path.dirname(configPath),model));assert.equal(b.readUInt32LE(0),0x46546c67);assert.equal(b.readUInt32LE(8),b.length);
+  const gltf=JSON.parse(b.subarray(20,20+b.readUInt32LE(12)).toString());assert(gltf.buffers.every(b=>!b.uri));assert(!gltf.images?.some(i=>i.uri));
+ }
 }
 console.log(JSON.stringify({passed:true,files:files.length,catalogues:directory.projects.length,dependencyAudit:{scope:'static relative import existence and selected private-data patterns only',externalDependenciesMeasured:false,browserNetworkVerified:false,dynamicImportsFullyResolved:false,cssDependenciesTraversed:false,licenseAuditPerformed:false},gpuVerified:false}));

@@ -14,25 +14,21 @@ function safeReference(value){
 function directory(value,base){safeReference(value);const u=new URL(value,base);if(!['http:','https:'].includes(u.protocol)||u.username||u.password||u.search||u.hash||!u.pathname.endsWith('/'))throw Error('Registered resource directory required');return u;}
 export function validateResourceReference(value){safeReference(value);return value}
 export function resolveResourceRoot(value,base){return directory(value,base).href}
-export function createResourceResolver({projectId='legacy',datasetId='verified',assetRoot,origin,resourceMounts,externalOrigins=[],registeredProjectRoots=[],nativeModuleBase,dataKind='indexed'}={}){
+export function createResourceResolver({projectId='legacy',datasetId='verified',assetRoot,origin,resourceMounts,externalOrigins=[],registeredProjectRoots=[]}={}){
  const fallback=origin||globalThis.location?.origin||ORIGIN_FALLBACK,root=directory(assetRoot||'./',fallback+'/'),site=root.origin;if(origin&&new URL(origin).origin!==site)throw Error('Project assetRoot must remain on the registered site');
  const external=new Set(externalOrigins.map(value=>{const u=new URL(value);if(u.protocol!=='https:'||u.username||u.password||u.pathname!=='/'||u.search||u.hash)throw Error('Exact HTTPS external origin required');return u.origin}));
  const otherRoots=registeredProjectRoots.map(value=>directory(value,root)).filter(u=>u.origin===site&&u.href!==root.href);
- const specs=resourceMounts||[{logicalPrefix:dataKind==='entity'?'/entity/':'/assets/',target:dataKind==='entity'?'./':'assets/'}];
+ const specs=resourceMounts||[{logicalPrefix:'/assets/',target:'assets/'}];
  const mounts=specs.map(spec=>{if(!spec||typeof spec.logicalPrefix!=='string'||!/^\/(?:[A-Za-z0-9._-]+\/)+$/.test(spec.logicalPrefix)||spec.logicalPrefix.split('/').includes('..'))throw Error('Registered logical resource prefix required');const target=directory(spec.target||'./',root);if(target.origin!==site||!beneath(target.pathname,root.pathname))throw Error('Resource mount escapes project root');return {prefix:spec.logicalPrefix,target}}).sort((a,b)=>b.prefix.length-a.prefix.length);
- const native=new Set(),supplemental=new Map(),nativeModule=dataKind==='entity'&&nativeModuleBase?directory(nativeModuleBase,root):null;
- if(nativeModule&&nativeModule.origin!==site)throw Error('Native module base must remain on registered site');
  function externalLink(value){safeReference(value);const url=new URL(value);if(url.protocol!=='https:'||url.username||url.password||!external.has(url.origin))throw Error('External source/download origin is not registered');return value;}
  function resolve(value,{kind='asset'}={}){
   if(value==null||value==='')return value;safeReference(value);
-  if(!['asset','dependency','evidence','download','external-source','module','native'].includes(kind))throw Error('Unknown resource reference kind');
+  if(!['asset','dependency','evidence','download','external-source'].includes(kind))throw Error('Unknown resource reference kind');
   if(kind==='external-source')return externalLink(value);
   if(/^[a-z][a-z0-9+.-]*:/i.test(value)&&!/^https?:/i.test(value))throw Error('Unknown resource protocol');
   const raw=new URL(value,root);if(raw.username||raw.password||raw.search&&kind!=='download')throw Error('Resource credentials/query are not permitted');
   if(raw.origin!==site){if(kind==='download')return externalLink(value);throw Error('External asset fetch is not permitted');}
   if(raw.search)throw Error('Local resource query is not permitted');
-  if(kind==='native'){if(!native.has(raw.pathname)||raw.hash)throw Error('Unregistered native resource declaration');return raw.href;}
-  if(kind==='module'&&nativeModule&&beneath(raw.pathname,nativeModule.pathname)){if(raw.hash||!(/\.(?:mjs|js)$/.test(raw.pathname)))throw Error('Registered native JavaScript module required');return raw.href;}
   if(otherRoots.some(u=>beneath(raw.pathname,u.pathname)&&!beneath(raw.pathname,root.pathname)))throw Error('Cross-project source path denied');
   let target=raw;
   // Already-resolved URLs within this project are idempotent. Logical absolute

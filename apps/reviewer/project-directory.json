@@ -13,6 +13,12 @@
       "label": "示例目录 B",
       "config": "demo-b/project-config.json",
       "assetRoot": "./"
+    },
+    {
+      "id": "animation-example",
+      "label": "自制动画接入练习（待 WebGL 复验）",
+      "config": "animation-example/project-config.json",
+      "assetRoot": "./"
     }
   ]
 }

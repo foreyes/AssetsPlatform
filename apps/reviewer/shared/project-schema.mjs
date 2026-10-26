@@ -8,8 +8,8 @@ export function validateProjectDescriptor(descriptor, entry, path = 'project-con
   requireField(record(descriptor), path, 'expected descriptor object');
   for (const field of ['id', 'datasetId', 'assetRoot', 'dataKind']) requireField(nonempty(descriptor[field]), `${path}.${field}`, 'required non-empty string');
   requireField(descriptor.id === entry.id, `${path}.id`, 'registered project identity mismatch');
-  requireField(['indexed', 'entity'].includes(descriptor.dataKind), `${path}.dataKind`, 'unsupported data adapter');
-  requireField(record(descriptor.renderer) && ['three', 'entity'].includes(descriptor.renderer.kind), `${path}.renderer.kind`, 'expected three or entity');
+  requireField(descriptor.dataKind === 'indexed', `${path}.dataKind`, 'unsupported data adapter');
+  requireField(record(descriptor.renderer) && descriptor.renderer.kind === 'three', `${path}.renderer.kind`, 'expected three');
   if (descriptor.renderer.kind === 'three') requireField(nonempty(descriptor.renderer.module), `${path}.renderer.module`, 'required module path');
   requireField(record(descriptor.config), `${path}.config`, 'required object');
   for (const field of ['label', 'reviewKey', 'renderPreferenceKey', 'importFormat', 'exportPrefix', 'defaultProfile']) requireField(nonempty(descriptor.config[field]), `${path}.config.${field}`, 'required non-empty string');
