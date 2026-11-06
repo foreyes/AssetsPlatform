@@ -55,6 +55,17 @@ test('unsafe IDs, symlinks, overlapping paths and oversized GLBs are refused',()
   assert.throws(()=>importDirectory({...x,id:'../../escape'}));
   assert.throws(()=>importDirectory({...x,output:path.join(x.source,'output')}),/outside/);
   assert.throws(()=>importDirectory({...x,output:path.join(root,'output')}),/outside/);
+  assert.throws(()=>importDirectory({...x,source:path.parse(x.dir).root}),/outside/);
+  if (process.platform === 'win32') {
+   const sourceAlias = path.join(x.dir, 'SOURCE');
+   if (fs.existsSync(sourceAlias)) {
+    assert.throws(()=>importDirectory({...x,output:path.join(sourceAlias,'output')}),/outside/);
+   }
+   const repositoryAlias = root.toLowerCase();
+   if (repositoryAlias !== root && fs.existsSync(repositoryAlias)) {
+    assert.throws(()=>importDirectory({...x,output:path.join(repositoryAlias,'output')}),/outside/);
+   }
+  }
   fs.symlinkSync(path.join(x.source,'cube.glb'),path.join(x.source,'link.glb'));assert.throws(()=>importDirectory(x),/Symbolic links/);fs.unlinkSync(path.join(x.source,'link.glb'));
   fs.symlinkSync(x.source,path.join(x.dir,'alias'));assert.throws(()=>importDirectory({...x,source:path.join(x.dir,'alias')}),/Symbolic links/);
   const fd=fs.openSync(path.join(x.source,'large.glb'),'w');fs.ftruncateSync(fd,64*1024*1024+1);fs.closeSync(fd);assert.throws(()=>importDirectory(x),/byte budget/);assert(!fs.existsSync(x.output));

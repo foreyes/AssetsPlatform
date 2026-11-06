@@ -9,7 +9,15 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const app = path.join(root, 'apps/reviewer');
 export const IMPORT_LIMITS = Object.freeze({models:512, entries:10000, depth:32, totalBytes:256*1024*1024});
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-const within = (child, parent) => child === parent || child.startsWith(parent + path.sep);
+function within(child, parent) {
+  let current = child;
+  while (current !== parent) {
+    const ancestor = path.dirname(current);
+    if (ancestor === current) return false;
+    current = ancestor;
+  }
+  return true;
+}
 function noLinks(target) {
   let current = path.parse(target).root;
   for (const segment of target.slice(current.length).split(path.sep).filter(Boolean)) {
@@ -32,9 +40,15 @@ export function importDirectory({source, output, id, label=id}) {
   if (!source || !output || !/^[a-z][a-z0-9-]{0,63}$/.test(id || '')) throw Error('Required: --source folder --output NEW-folder --id lowercase-project-id');
   if (typeof label !== 'string' || !label.trim() || label.length>160) throw Error('Label must contain 1–160 characters');
   source=path.resolve(source); output=path.resolve(output);
-  noLinks(source); noLinks(path.dirname(output));
+  const outputParent = path.dirname(output);
+  noLinks(source); noLinks(outputParent);
   if (!fs.statSync(source).isDirectory()) throw Error('Source must be a directory');
-  if (within(output,root) || within(output,source) || within(source,output)) throw Error('Output must be outside source and platform repository');
+  // Canonical names match filesystem aliases without folding distinct case-sensitive siblings.
+  const canonicalSource = fs.realpathSync.native(source);
+  const canonicalRoot = fs.realpathSync.native(root);
+  const canonicalOutput = path.join(fs.realpathSync.native(outputParent), path.basename(output));
+  if (within(canonicalOutput, canonicalRoot) || within(canonicalOutput, canonicalSource) ||
+      within(canonicalSource, canonicalOutput)) throw Error('Output must be outside source and platform repository');
   if (fs.existsSync(output)) throw Error('Output already exists; nothing overwritten');
   const files=[]; let entries=0, totalBytes=0;
   function scan(dir, depth=0) {
