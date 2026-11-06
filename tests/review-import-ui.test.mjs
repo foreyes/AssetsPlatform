@@ -75,6 +75,7 @@ class Element {
     for (const run of this.events.get('close') || []) run();
   }
   after(element) { this.following = element; }
+  scrollIntoView() {}
 }
 
 let fixtureId = 0;
@@ -147,7 +148,7 @@ async function boot(t, mode, {
       return values.get(key) ?? null;
     },
     setItem: (key, value) => {
-      if (storageError === 'method') throw Error('Storage write blocked');
+      if (storageError === 'method' || storageError === key) throw Error('Storage write blocked');
       calls.push(key);
       values.set(key, value);
     }
@@ -352,12 +353,46 @@ for (const mode of Object.keys(reviewer)) {
     for (const id of ['#import-btn', '#mobile-import', '#audit-import']) assert.equal(h.get(id).disabled, false);
     await h.choose(async () => h.backup({ reviews: { [libraryAsset.id]: incomingReview } }));
     assert.equal(h.stored().reviews[libraryAsset.id].comment, incomingReview.comment);
+    assert.deepEqual(h.stored().selected, [asset.id]);
+    assert.match(h.toast(), /已合并 1 条有效记录并保存到当前浏览器/);
     const nextFile = deferred();
     const nextImport = h.choose(() => nextFile.promise);
     nextFile.resolve(h.backup({ reviews: { unknown: incomingReview }, selected: ['unknown'] }));
     await nextImport;
     assert.match(h.toast(), /已合并 0 条有效记录/);
     assert(!h.app.selected.has('unknown'));
+  });
+
+  test(`${mode} reports incomplete merge saves and retains the merged state for export`, async t => {
+    const h = await boot(t, mode, { initialSelection: [] });
+    await h.ready();
+    h.setStorageError(h.config.reviewKey);
+    await h.choose();
+    const firstResult = h.toast();
+    assert.match(firstResult, /当前页面合并 1 条有效记录.*未能完整保存.*导出备份/);
+    assert.equal(h.stored().reviews[asset.id].comment, oldReview.comment);
+    assert.deepEqual(h.calls, []);
+
+    h.get('#mobile-audit').onclick();
+    h.setStorageError(h.config.selectionStorageKey);
+    await h.choose();
+    assert.equal(h.toast(), firstResult);
+    const auditResult = h.get('#audit-import-status').textContent;
+    assert.match(auditResult, /当前页面合并 1 条有效记录.*未能完整保存.*导出备份/);
+    assert.equal(h.stored().reviews[asset.id].comment, incomingReview.comment);
+    assert.equal(h.values.get(h.config.selectionStorageKey), '[]');
+    assert.equal(h.get('#storage-warning').hidden, false);
+
+    h.get('#export-all').onclick();
+    const exported = JSON.parse(await h.downloads[0].blob.text());
+    assert.equal(exported.reviews[asset.id].comment, incomingReview.comment);
+    assert.deepEqual(exported.selected, [asset.id]);
+
+    h.setStorageError(undefined);
+    await h.choose();
+    assert.match(h.get('#audit-import-status').textContent, /已合并 1 条有效记录并保存到当前浏览器/);
+    assert.equal(h.values.get(h.config.selectionStorageKey), JSON.stringify([asset.id]));
+    assert.equal(h.get('#storage-warning').hidden, true);
   });
 
   test(`${mode} keeps import disabled after catalogue load failure`, async t => {
@@ -907,6 +942,37 @@ test('hosted keeps account storage warnings separate from acknowledged server su
   assert.match(control('lists').textContent, /Post-publish refresh failed/);
   assert.equal(warning.hidden, false);
   assert.match(warning.textContent, /无法读取或保存账号草稿/);
+});
+
+test('hosted merge reflects account draft storage separately from a review-only merge', async t => {
+  const h = await boot(t, 'hosted', { shared: true });
+  await h.ready();
+  const draftKey = 'asset-review-selection-v1:fixture:reviewer';
+  h.setStorageError(draftKey);
+  await h.choose(async () => h.backup({ selected: [] }));
+  assert.match(h.toast(), /已合并 1 条有效记录并保存到当前浏览器/);
+  await h.choose();
+  assert.match(h.toast(), /未能完整保存.*新增选择尚未发布/);
+  assert.equal(h.values.has(draftKey), false);
+  assert(h.app.selected.has(asset.id));
+  await h.choose();
+  assert.match(h.toast(), /未能完整保存/);
+
+  h.setStorageError(undefined);
+  await h.choose();
+  assert.match(h.toast(), /保存到当前浏览器/);
+  assert.deepEqual(JSON.parse(h.values.get(draftKey)).ids, [asset.id]);
+  assert(h.requests.every(([, method]) => method === 'GET'));
+});
+
+test('hosted merge reports incomplete saving if a shared selection has no authenticated draft', async t => {
+  const h = await boot(t, 'hosted', { shared: true, sharedSession: Promise.resolve(null) });
+  await h.ready();
+  await h.choose();
+  assert.match(h.toast(), /未能完整保存.*新增选择尚未发布/);
+  assert.equal(h.stored().reviews[asset.id].comment, incomingReview.comment);
+  assert.deepEqual(h.stored().selected, []);
+  assert(h.app.selected.has(asset.id));
 });
 
 test('hosted server manifest includes resolvable roots outside the UI and refuses incomplete exports', async t => {

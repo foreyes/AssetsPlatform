@@ -206,6 +206,12 @@ function showToast(message) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => $('#toast').hidden = true, 4200);
 }
+function showReviewImportResult(message) {
+  const status = $('#audit-modal').open && $('#audit-import-status');
+  if (!status) return showToast(message);
+  status.textContent = message;
+  status.scrollIntoView({ block: 'nearest' });
+}
 function reviewOf(item) {
   return reviews[item.id] || {
     status: 'pending',
@@ -1397,7 +1403,13 @@ function buildAudit() {
   load.className = 'light-btn';
   load.textContent = '导入审阅记录';
   load.disabled = !isReviewImportReady;
-  load.onclick = () => $('#import-file').click();
+  const importStatus = document.createElement('div');
+  importStatus.id = 'audit-import-status';
+  importStatus.setAttribute('role', 'status');
+  load.onclick = () => {
+    importStatus.textContent = '';
+    $('#import-file').click();
+  };
   content.append(load);
   const restore = document.createElement('button');
   restore.id = 'restore-review-btn';
@@ -1406,7 +1418,7 @@ function buildAudit() {
   restore.disabled = !canRestoreReviewSnapshot(config);
   restore.title = restore.disabled ? '仅支持单存储键的本地审阅' : '替换当前审阅与选择；请先导出完整备份';
   restore.onclick = () => $('#restore-file').click();
-  content.append(restore);
+  content.append(restore, importStatus);
 }
 function compareSelected() {
   const list = items.filter(a => selected.has(a.id));
@@ -1632,7 +1644,7 @@ $('#import-file').onchange = async event => {
     if (!imported) return;
     Object.assign(reviews, imported.reviews);
     imported.selected.forEach(id => selected.add(id));
-    persist();
+    const isSaved = persist();
     if (current) {
       if (Object.hasOwn(imported.reviews, current.id)) {
         clearTimeout(commentTimer);
@@ -1643,9 +1655,12 @@ $('#import-file').onchange = async event => {
       $('#detail-selected').checked = selected.has(current.id);
     }
     render();
-    showToast(`已合并 ${Object.keys(imported.reviews).length} 条有效记录，忽略未知 ID；同一资产采用导入记录。`);
+    const count = Object.keys(imported.reviews).length;
+    showReviewImportResult(isSaved
+      ? `已合并 ${count} 条有效记录并保存到当前浏览器。`
+      : `已在当前页面合并 ${count} 条有效记录，浏览器未能完整保存。请在刷新或离开前导出备份。`);
   } catch (error) {
-    if (generation === restoreGeneration) showToast('导入失败：' + error.message);
+    if (generation === restoreGeneration) showReviewImportResult('导入失败：' + error.message);
   } finally {
     if (generation === restoreGeneration) event.target.value = '';
   }

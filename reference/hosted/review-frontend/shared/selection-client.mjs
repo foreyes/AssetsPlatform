@@ -25,10 +25,15 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
   catch{storageWarning.hidden=false;return null}
  };
  const saveDraft=()=>{
+  if(!identity)return false;
   try{
    browserStorage.setItem(key,JSON.stringify({ids:[...getSelected()],nickname:$('partner-nickname').value,baseRevision:knownServerRevision,updatedAt:new Date().toISOString()}));
    storageWarning.hidden=true;
-  }catch{storageWarning.hidden=false}
+   return true;
+  }catch{
+   storageWarning.hidden=false;
+   return false;
+  }
  };
  const api=async(path,options={})=>{const r=await fetch(path,{credentials:'same-origin',cache:'no-store',...options});let body;try{body=await r.json()}catch{throw Error('登录或网络不可用，请重新登录后刷新。')}if(!r.ok)throw Object.assign(Error(body.error||String(r.status)),{status:r.status});return body};
  const safeRun=fn=>async()=>{if(busy)return;busy=true;try{await fn()}catch(e){status(e.status===409?'服务器版本已变化。草稿未丢失，请先刷新并载入服务器版本，再合并所需选择。':`操作未完成：${e.message}。本地草稿未自动分享。`)}finally{busy=false}};
@@ -58,7 +63,13 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
  });
  const hasNewServerRevision=()=>mine&&mine.revision!==knownServerRevision;
  const newServerRevisionMessage='服务器清单已更新。本地草稿保留；点击“载入服务器版本”会替换当前草稿。';
- const changed=()=>{if(!identity)return;dirty=true;saveDraft();status(`本浏览器草稿 ${getSelected().size} 项，尚未发布给伙伴。`)};
+ const changed=()=>{
+  if(!identity)return false;
+  dirty=true;
+  const isSaved=saveDraft();
+  status(`本浏览器草稿 ${getSelected().size} 项，尚未发布给伙伴。`);
+  return isSaved;
+ };
  $('partner-refresh').onclick=safeRun(async()=>{
   if(!identity||!await refresh())return;
   status(hasNewServerRevision()?newServerRevisionMessage:'共享清单已刷新。本地勾选仍是你的草稿。');
@@ -125,7 +136,7 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
    container.querySelector('.partner-downloads')?.remove();container.append(box);
   }catch{/* Existing original download links stay intact. */}
  }
- return {changed,decorateDownloads};
+ return {changed,decorateDownloads,saveDraft};
 }
 
 /** Download presentation only; identity, local drafts and server writes are unchanged. */
