@@ -1,14 +1,21 @@
 /** Resolve only needed immutable catalog shards; no external URLs, no credentials. */
 export async function resolveSelectionAssets(catalog,ids,readShard) {
- const wanted=new Set(ids),pending=[...ids],assets=[],cache=new Map();
- while(pending.length){const id=pending.pop(),pointer=catalog.assets[id];if(!pointer)continue;
+ const wanted=new Set(ids),pending=[...wanted].map(id=>({id})),assets=[],cache=new Map();
+ while(pending.length){
+  const {id,parent}=pending.pop();
+  const context=parent===undefined?id:`${id}（由 ${parent} 引用）`;
+  const pointer=Object.hasOwn(catalog?.assets??{},id)?catalog.assets[id]:null;
+  if(!pointer)throw Error(`交付索引缺少资源 ${context}`);
   let asset=pointer;
   if(typeof pointer==='string'){
    if(!/^\/delivery-shards\/[0-9a-f]{2}\.json(?:\.gz)?$/.test(pointer))throw Error('invalid-catalog-shard');
-   if(!cache.has(pointer))cache.set(pointer,await readShard(pointer));asset=cache.get(pointer)[id];
+   if(!cache.has(pointer))cache.set(pointer,await readShard(pointer));
+   const shard=cache.get(pointer);
+   asset=Object.hasOwn(shard??{},id)?shard[id]:null;
   }
-  if(!asset||asset.id!==id)throw Error('missing-catalog-asset');assets.push(asset);
-  for(const dep of asset.dependencyIds||[])if(!wanted.has(dep)){wanted.add(dep);pending.push(dep)}
+  if(!asset||asset.id!==id)throw Error(`交付分片缺少资源 ${context}`);
+  assets.push(asset);
+  for(const dep of asset.dependencyIds||[])if(!wanted.has(dep)){wanted.add(dep);pending.push({id:dep,parent:id})}
  }
  return assets;
 }

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { resolveSelectionAssets } from '../reference/hosted/review-frontend/shared/selection-manifest.mjs';
 
 const reviewer = {
   public: new URL('../apps/reviewer/', import.meta.url),
@@ -61,7 +62,7 @@ class Element {
 }
 
 let fixtureId = 0;
-async function boot(t, mode, { shared = false, sharedSession, sharedList } = {}) {
+async function boot(t, mode, { shared = false, sharedSession, sharedList, responses = {}, storageError, initialSelection } = {}) {
   const root = reviewer[mode];
   const appRoot = mode === 'hosted' ? new URL('shared/', root) : root;
   const html = await readFile(new URL('index.html', appRoot), 'utf8');
@@ -87,6 +88,16 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList } = {})
     const auditButton = dom.querySelector('#audit-content').children.find(node => '#' + node.id === selector);
     return auditButton || dom.querySelector(selector);
   };
+  let cards = [];
+  Object.defineProperty(get('#grid'), 'innerHTML', {
+    set: html => {
+      cards = [...html.matchAll(/<article class="asset-card[^"]*" data-id="([^"]+)"/g)].map(([, id]) => {
+        const card = new Element();
+        card.dataset.id = id;
+        return card;
+      });
+    }
+  });
   const comment = get('#comment');
   let textareaValue = '';
   Object.defineProperty(comment, 'value', {
@@ -106,10 +117,18 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList } = {})
     version: 1, projectId: config.projectId, datasetId: config.datasetId,
     reviews: { [asset.id]: oldReview }, selected: []
   })]]);
+  if (initialSelection) {
+    config.selectionStorageKey = 'fixture-selection';
+    values.set(config.selectionStorageKey, JSON.stringify(initialSelection));
+  }
   const calls = [];
   const localStorage = {
-    getItem: key => values.get(key) ?? null,
+    getItem: key => {
+      if (storageError === 'method') throw Error('Storage read blocked');
+      return values.get(key) ?? null;
+    },
     setItem: (key, value) => {
+      if (storageError === 'method') throw Error('Storage write blocked');
       calls.push(key);
       values.set(key, value);
     }
@@ -121,9 +140,13 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList } = {})
   };
   const requests = [];
   let listRequests = 0;
-  const fetch = async (path, { method = 'GET' } = {}) => {
-    requests.push([path, method]);
+  const fetch = async (path, { method = 'GET', body: requestBody } = {}) => {
+    requests.push([path, method, requestBody]);
     let body;
+    if (Object.hasOwn(responses, path)) {
+      body = await responses[path](requestBody);
+      return new Response(JSON.stringify(body));
+    }
     switch (path) {
       case '/api/selection/session':
         body = sharedSession ? await sharedSession : { userId: 'reviewer' };
@@ -134,28 +157,53 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList } = {})
       case '/delivery-status.json':
         body = {};
         break;
+      case '/delivery-index.json':
+        body = { assets: {} };
+        break;
       default:
         assert.fail(`Unexpected request ${method} ${path}`);
     }
     return new Response(JSON.stringify(body));
   };
   const timers = new Map();
+  const downloads = [], blobs = new Map(), confirmations = [];
+  let acceptConfirmation = true;
+  const confirm = message => {
+    confirmations.push(message);
+    return acceptConfirmation;
+  };
+  class FixtureURL extends URL {
+    static createObjectURL(blob) {
+      const url = 'blob:fixture/' + blobs.size;
+      blobs.set(url, blob);
+      return url;
+    }
+    static revokeObjectURL(url) { blobs.delete(url); }
+  }
   const bindings = {
     document: {
-      querySelector: get, getElementById: id => get('#' + id), createElement: () => new Element(),
+      querySelector: get, getElementById: id => get('#' + id), createElement: tag => {
+        const node = new Element();
+        if (tag === 'a') {
+          node.click = () => downloads.push({ name: node.download, blob: blobs.get(node.href) });
+          node.remove = () => {};
+        }
+        return node;
+      },
       querySelectorAll: selector => {
         switch (selector) {
+          case '.asset-card': return cards;
           case '.review-buttons button': return buttons;
           default: return [];
         }
       },
       addEventListener() {}, body: new Element()
     },
-    window: { addEventListener(name, run) {
+    window: { confirm, addEventListener(name, run) {
       if (!windowEvents.has(name)) windowEvents.set(name, []);
       windowEvents.get(name).push(run);
     } },
-    location: { href: url, assign() {} }, localStorage, fetch,
+    location: { href: url, origin: config.origin, assign() {} }, localStorage, fetch, confirm, URL: FixtureURL,
     __importFixture: {
       project, catalogue, setTimeout: (run, delay) => {
         const timer = Symbol();
@@ -168,7 +216,11 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList } = {})
   };
   for (const [name, value] of Object.entries(bindings)) {
     const previous = Object.getOwnPropertyDescriptor(globalThis, name);
-    Object.defineProperty(globalThis, name, { value, configurable: true });
+    const property = name === 'localStorage' ? { get() {
+      if (storageError === 'getter') throw Error('Storage getter blocked');
+      return value;
+    } } : { value };
+    Object.defineProperty(globalThis, name, { ...property, configurable: true });
     t.after(() => previous ? Object.defineProperty(globalThis, name, previous) : delete globalThis[name]);
   }
   const projectImport = /import \{ loadProject, loadProjectData, objectCategory, assetURL \} from '[^']+';/;
@@ -204,7 +256,10 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList } = {})
   const stored = () => JSON.parse(values.get(config.reviewKey));
   const dispatch = event => windowEvents.get(event)?.forEach(run => run({ persisted: true }));
   return {
-    app, get, config, buttons, calls, values, stored, requests, choose, backup, dispatch,
+    app, get, config, buttons, calls, values, stored, requests, choose, backup, dispatch, downloads, confirmations,
+    cardCheckbox: () => cards[0].querySelector('.card-check'),
+    setStorageError: error => { storageError = error; },
+    acceptConfirmation: value => { acceptConfirmation = value; },
     ready: async () => {
       catalogue.resolve(data);
       await app.ready;
@@ -400,13 +455,28 @@ test('hosted enables merge after account draft hydration while the initial share
   const controls = ['#import-btn', '#mobile-import', '#audit-import'];
   assert(h.requests.some(([path]) => path === '/api/selection/session'));
   for (const id of controls) assert.equal(h.get(id).disabled, true);
+  const card = h.cardCheckbox(), detail = h.get('#detail-selected'), clear = h.get('#clear-selection');
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  for (const control of [card, detail, clear]) assert.equal(control.disabled, true);
+  card.checked = detail.checked = true;
+  card.onchange({ target: card });
+  detail.onchange({ target: detail });
+  assert.equal(h.app.selected.size, 0);
+  assert.equal(card.checked, false);
+  assert.equal(detail.checked, false);
+  await h.choose(() => assert.fail('read before account draft hydration'));
+  assert.deepEqual(h.calls, []);
+  await h.app.openDetail(h.app.itemMap.get(libraryAsset.id));
+  assert.equal(detail.checked, false);
   session.resolve({ userId: 'reviewer' });
   await new Promise(resolve => setImmediate(resolve));
   assert(h.requests.some(([path]) => path === '/api/selections'));
   assert.equal(ready, true, 'catalogue initialization must finish without the shared list');
   await loading;
   for (const id of controls) assert.equal(h.get(id).disabled, false);
+  for (const control of [h.cardCheckbox(), detail, clear]) assert.equal(control.disabled, false);
   assert.deepEqual([...h.app.selected], [libraryAsset.id]);
+  assert.equal(detail.checked, true);
   await h.choose();
   assert.deepEqual(JSON.parse(h.values.get(draftKey)).ids, [libraryAsset.id, asset.id]);
 
@@ -417,4 +487,203 @@ test('hosted enables merge after account draft hydration while the initial share
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(partner.querySelector('#partner-total').textContent, '(0)');
   assert.deepEqual([...h.app.selected], [libraryAsset.id, asset.id]);
+});
+
+test('hosted unlocks local selection after the account session fails', async t => {
+  const session = deferred();
+  const h = await boot(t, 'hosted', { shared: true, sharedSession: session.promise, initialSelection: [asset.id] });
+  const loading = h.ready();
+  await new Promise(resolve => setImmediate(resolve));
+  const clear = h.get('#clear-selection');
+  assert.equal(clear.disabled, true);
+  clear.onclick();
+  assert.deepEqual([...h.app.selected], [asset.id]);
+  session.reject(Error('Unavailable session'));
+  await loading;
+  assert.equal(clear.disabled, false);
+  assert.equal(h.get('#import-btn').disabled, false);
+  clear.onclick();
+  assert.equal(h.app.selected.size, 0);
+  const checkbox = h.cardCheckbox();
+  checkbox.checked = true;
+  checkbox.onchange({ target: checkbox });
+  assert.deepEqual([...h.app.selected], [asset.id]);
+  assert.deepEqual(JSON.parse(h.values.get(h.config.selectionStorageKey)), [asset.id]);
+  const partner = h.get('main > header').following;
+  assert.match(partner.querySelector('#partner-status').textContent, /共享选择暂不可用/);
+});
+
+for (const field of ['selection', 'nickname']) {
+  test(`hosted publish acknowledges only the submitted draft and protects a later ${field} edit`, async t => {
+    const put = deferred(), subsequentList = deferred();
+    let mine = { userId: 'reviewer', nickname: 'Original', ids: [asset.id], revision: 2 };
+    let listReads = 0;
+    const h = await boot(t, 'hosted', { shared: true, sharedSession: { userId: 'reviewer', mine }, responses: {
+      '/api/selections': () => ++listReads === 2 ? subsequentList.promise : { lists: [mine] },
+      '/api/selections/me': () => put.promise
+    } });
+    await h.ready();
+    const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+    const publishing = control('publish').onclick();
+    const request = h.requests.find(([path]) => path === '/api/selections/me');
+    assert.equal(request[1], 'PUT');
+    assert.deepEqual(JSON.parse(request[2]), { nickname: 'Original', ids: [asset.id], revision: 2 });
+    if (field === 'selection') {
+      await h.choose(async () => h.backup({ selected: [libraryAsset.id] }));
+    } else {
+      control('nickname').value = 'Later edit';
+      control('nickname').oninput();
+    }
+    mine = { ...mine, revision: 3 };
+    put.resolve({ mine });
+    await publishing;
+    const draft = JSON.parse(h.values.get('asset-review-selection-v1:fixture:reviewer'));
+    assert.equal(draft.baseRevision, 3);
+    assert.equal(draft.nickname, field === 'nickname' ? 'Later edit' : mine.nickname);
+    assert.deepEqual(draft.ids, field === 'selection' ? [asset.id, libraryAsset.id] : mine.ids);
+    assert.match(control('status').textContent, /已发布提交时的 1 项.*仍未发布/);
+    h.acceptConfirmation(false);
+    await control('load').onclick();
+    assert.equal(h.confirmations.length, 1);
+    assert.deepEqual([...h.app.selected], draft.ids);
+    assert.equal(control('nickname').value, draft.nickname);
+    h.acceptConfirmation(true);
+    await control('load').onclick();
+    assert.equal(h.confirmations.length, 2);
+    assert.deepEqual([...h.app.selected], mine.ids);
+    assert.equal(control('nickname').value, mine.nickname);
+    subsequentList.resolve({ lists: [mine] });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(control('status').textContent, /已载入本人服务器版本/);
+  });
+}
+
+for (const mode of Object.keys(reviewer)) {
+  test(`${mode} keeps rendering, editing, changing profiles and exporting when the Storage getter throws`, async t => {
+    const h = await boot(t, mode, { storageError: 'getter' });
+    await h.ready();
+    assert.equal(h.get('#storage-warning').hidden, false);
+    const item = h.app.itemMap.get(asset.id);
+    await h.app.openDetail(item);
+    const detail = h.get('#detail-selected');
+    detail.checked = true;
+    detail.onchange({ target: detail });
+    h.edit('In-memory edit');
+    h.commentTimers()[0].run();
+    const profile = h.get('#default-profile');
+    profile.value = h.config.defaultProfile;
+    profile.onchange({ target: profile });
+    assert.match(h.get('#default-profile-note').textContent, /无法保存/);
+    assert.match(h.get('#save-status').textContent, /保存失败/);
+    assert.deepEqual(h.calls, []);
+    h.get('#export-all').onclick();
+    const exported = JSON.parse(await h.downloads[0].blob.text());
+    assert.equal(exported.reviews[asset.id].comment, 'In-memory edit');
+    assert.deepEqual(exported.selected, [asset.id]);
+  });
+}
+
+test('public exact restore retains memory and prior storage when Storage access fails after confirmation', async t => {
+  const h = await boot(t, 'public');
+  await h.ready();
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.edit('Pending edit');
+  for (const error of ['getter', 'method']) {
+    const input = h.get('#restore-file');
+    input.files = [{ size: 100, text: async () => h.backup({ scope: 'full-catalogue' }) }];
+    h.setStorageError(error);
+    await input.onchange({ target: input });
+    assert.match(h.toast(), /浏览器保存失败，未替换当前审阅与选择/);
+    assert.equal(h.app.reviews[asset.id].comment, oldReview.comment);
+    assert.equal(h.stored().reviews[asset.id].comment, oldReview.comment);
+    assert.equal(h.get('#comment').value, 'Pending edit');
+    assert.equal(h.commentTimers().length, 1);
+    assert.equal(h.app.selected.size, 0);
+    assert.deepEqual(h.calls, []);
+  }
+  assert.equal(h.confirmations.length, 2);
+});
+
+test('hosted keeps account storage warnings separate from acknowledged server success', async t => {
+  const mine = { userId: 'reviewer', nickname: 'Account', ids: [asset.id], revision: 1 };
+  let listReads = 0;
+  const h = await boot(t, 'hosted', { shared: true, sharedSession: { userId: 'reviewer', mine }, storageError: 'getter', responses: {
+    '/api/selections': () => {
+      if (++listReads > 1) throw Error('Post-publish refresh failed');
+      return { lists: [mine] };
+    },
+    '/api/selections/me': body => ({ mine: { ...mine, ...JSON.parse(body), revision: 2 } })
+  } });
+  await h.ready();
+  const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+  const warning = control('status').following;
+  assert.equal(warning.hidden, false);
+  assert.deepEqual([...h.app.selected], [asset.id]);
+  control('nickname').value = 'Changed name';
+  control('nickname').oninput();
+  assert.match(control('status').textContent, /尚未发布/);
+  assert.equal(warning.hidden, false);
+  await control('publish').onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(control('status').textContent, /已发布 1 项/);
+  assert.match(control('lists').textContent, /Post-publish refresh failed/);
+  assert.equal(warning.hidden, false);
+  assert.match(warning.textContent, /无法读取或保存账号草稿/);
+});
+
+test('hosted server manifest includes resolvable roots outside the UI and refuses incomplete exports', async t => {
+  const partnerList = { userId: 'partner', nickname: 'Partner', ids: [asset.id], revision: 1 };
+  const root = 'not-in-catalogue', dependency = 'nested-file', shard = '/delivery-shards/ab.json';
+  let roots = [asset.id, root, root];
+  let index = { assets: { [asset.id]: { id: asset.id, files: [] }, [root]: shard, [dependency]: shard } };
+  const records = { [root]: { id: root, files: [], dependencyIds: [dependency] }, [dependency]: { id: dependency, files: [] } };
+  const h = await boot(t, 'hosted', { shared: true, responses: {
+    '/api/selections': () => ({ lists: [partnerList] }),
+    '/api/selections/manifest?user=partner': () => ({ selection: { ...partnerList, ids: roots } }),
+    '/delivery-index.json': () => index,
+    [shard]: () => records
+  } });
+  await h.ready();
+  await new Promise(resolve => setImmediate(resolve));
+  const panel = h.get('main > header').following;
+  const action = panel.querySelector('#partner-lists').children[0].querySelector('[data-manifest]');
+  const status = panel.querySelector('#partner-status');
+  await action.onclick();
+  const manifest = JSON.parse(await h.downloads[0].blob.text());
+  assert.deepEqual(manifest.selection.ids, [asset.id, root]);
+  assert.deepEqual(new Map(manifest.assets.map(entry => [entry.id, entry.selected])), new Map([
+    [root, true], [dependency, false], [asset.id, true]
+  ]));
+  assert.equal(h.requests.filter(([path]) => path === shard).length, 1);
+  assert.match(status.textContent, /已导出.*完整/);
+
+  delete index.assets[dependency];
+  await action.onclick();
+  assert.equal(h.downloads.length, 1);
+  assert.match(status.textContent, /缺少资源 nested-file.*由 not-in-catalogue 引用/);
+  assert.doesNotMatch(status.textContent, /已导出/);
+  roots = ['missing-root'];
+  await action.onclick();
+  assert.equal(h.downloads.length, 1);
+  assert.match(status.textContent, /缺少资源 missing-root/);
+  roots = [];
+  index = { assets: {} };
+  await action.onclick();
+  const empty = JSON.parse(await h.downloads[1].blob.text());
+  assert.deepEqual(empty.selection.ids, []);
+  assert.deepEqual(empty.assets, []);
+});
+
+test('manifest resolver rejects inherited pointers and inherited or missing shard records', async () => {
+  const asset = { id: 'root', files: [] }, shard = '/delivery-shards/ab.json';
+  await assert.rejects(
+    resolveSelectionAssets({ assets: Object.create({ root: asset }) }, ['root'], () => assert.fail('no own pointer')),
+    /交付索引缺少资源 root/
+  );
+  for (const records of [{}, Object.create({ root: asset })]) {
+    await assert.rejects(
+      resolveSelectionAssets({ assets: { root: shard } }, ['root'], async () => records),
+      /交付分片缺少资源 root/
+    );
+  }
 });

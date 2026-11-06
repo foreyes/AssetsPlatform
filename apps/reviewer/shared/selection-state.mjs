@@ -1,3 +1,9 @@
+// Resolve Storage only when a guarded read or write actually runs.
+export const browserStorage = {
+ getItem(key) { return globalThis.localStorage.getItem(key); },
+ setItem(key, value) { globalThis.localStorage.setItem(key, value); }
+};
+
 // The single review/selection persistence contract, with legacy format codecs.
 export function loadReviewState(storage,config){
  let reviews=Object.create(null),selected=[],legacySelected=[],ok=true;

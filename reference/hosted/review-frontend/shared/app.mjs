@@ -11,7 +11,7 @@ import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentit
 import { createPreviewQueue } from './shared/preview-queue.mjs';
 import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
-import { loadReviewState, saveReviewState } from './shared/selection-state.mjs';
+import { browserStorage, loadReviewState, saveReviewState } from './shared/selection-state.mjs';
 import { configureShell as mountShell, renderEvidenceSections } from './shared/shell-controller.mjs';
 import { getResourceResolver, mapResourceData, createProjectScope } from './shared/resource-url.mjs';
 const project = await guardStartup(() => loadProject());
@@ -96,6 +96,7 @@ let projectData,
 let reviews = Object.create(null),
   selected = new Set(),
   unavailableSelected = [],
+  isSelectionReady = config.sharedSelections === false,
   storageOK = true,
   current = null,
   filtered = [],
@@ -215,17 +216,16 @@ function reviewOf(item) {
   };
 }
 function persist() {
-  storageOK = saveReviewState(localStorage, config, {
+  storageOK = saveReviewState(browserStorage, config, {
     reviews,
     selected: [...selected, ...unavailableSelected],
     legacySelected
   });
   $('#storage-warning').hidden = storageOK;
-  partnerSelections?.changed();
   return storageOK;
 }
 function loadState() {
-  const saved = loadReviewState(localStorage, config);
+  const saved = loadReviewState(browserStorage, config);
   reviews = saved.reviews;
   selected = new Set(saved.selected);
   legacySelected = saved.legacySelected;
@@ -392,6 +392,7 @@ async function readJSON(url, required = true, options = {}) {
 }
 async function init() {
   loadState();
+  $('#storage-warning').hidden = storageOK;
   try {
     projectData = await loadProjectData(project, readJSON);
     const libraryDatasets = Object.keys(projectData.datasets ?? {});
@@ -430,7 +431,7 @@ async function init() {
       version: 1,
       flatCanopySourceMaterialIds: []
     };
-    defaultProfile = readDefaultProfile(localStorage, profiles);
+    defaultProfile = readDefaultProfile(browserStorage, profiles);
     profileA = defaultProfile;
     profileB = config.compareProfile || profiles.find(p => p.id !== profileA && p.implemented)?.id || profileA;
     items = [...objects, ...resources];
@@ -468,12 +469,19 @@ async function init() {
       getSelected: () => selected,
       replaceSelected: ids => {
         selected = new Set(ids);
+        syncDetailSelection();
         renderNavigation();
         render();
       },
       openItem: item => item.isObject ? openDetail(item) : openResource(item),
       getProfile: () => profileById(defaultProfile)
     });
+    if (!isSelectionReady) {
+      isSelectionReady = true;
+      syncDetailSelection();
+      if (current) partnerSelections.decorateDownloads(current, $('#detail-downloads'));
+      render();
+    }
     if (config.capabilities.research) await buildResearch();
     if (config.capabilities.effects) await buildWeaponEffects();
     isReviewImportReady = true;
@@ -484,7 +492,6 @@ async function init() {
     $('#result-description').textContent = '物件目录尚未成功载入';
     console.error(error);
   }
-  $('#storage-warning').hidden = storageOK;
 }
 function isObjectView() {
   return state.view === 'objects';
@@ -531,6 +538,7 @@ function renderStats() {
   const selectionCount = selected.size + unavailableCount;
   $('#selection-bar').hidden = !selectionCount;
   $('#selection-number').textContent = selectionCount;
+  $('#clear-selection').disabled = !isSelectionReady;
   const unavailableStatus = $('#selection-unavailable');
   unavailableStatus.hidden = !unavailableCount;
   unavailableStatus.textContent = unavailableCount ? `其中 ${unavailableCount} 项暂不可用` : '';
@@ -679,8 +687,11 @@ function render() {
   $$('[data-category]').forEach(button => button.classList.toggle('active', button.dataset.category === state.category));
   $$('.asset-card').forEach(card => {
     const item = itemMap.get(card.dataset.id);
-    card.querySelector('.card-check').onchange = event => {
+    const checkbox = card.querySelector('.card-check');
+    checkbox.disabled = !isSelectionReady;
+    checkbox.onchange = event => {
       toggleSelection(item.id, event.target.checked);
+      event.target.checked = selected.has(item.id);
       if (state.view === 'selected') render();else card.classList.toggle('selected', event.target.checked);
     };
     card.querySelector('.card-preview').onclick = () => openDetail(item);
@@ -722,9 +733,17 @@ function goToPage(requestedPage) {
   });
 }
 function toggleSelection(id, on) {
+  if (!isSelectionReady || selected.has(id) === on) return;
   if (on) selected.add(id);else selected.delete(id);
   persist();
+  partnerSelections?.changed();
+  syncDetailSelection();
   renderStats();
+}
+function syncDetailSelection() {
+  const checkbox = $('#detail-selected');
+  checkbox.disabled = !isSelectionReady;
+  checkbox.checked = current !== null && selected.has(current.id);
 }
 function metricHTML(item) {
   let rows;
@@ -1096,7 +1115,7 @@ async function openDetail(item) {
   const index = filtered.findIndex(a => a.id === item.id);
   $('#detail-index').textContent = index >= 0 ? `${index + 1} / ${filtered.length}` : '';
   $('#detail-tags').innerHTML = `<span>${item.isObject ? esc(config.objectViewLabel || '完整物件') : esc(typeLabels[item.type] || item.type)}</span><span>${esc(categoryLabel(item.category))}</span><span>${esc(previewLabel(item))}</span>`;
-  $('#detail-selected').checked = selected.has(item.id);
+  syncDetailSelection();
   $('#detail-metrics').innerHTML = metricHTML(item);
   $('#detail-provenance').innerHTML = provenanceHTML(item);
   $('#detail-downloads').innerHTML = downloadsHTML(item);
@@ -1421,9 +1440,13 @@ $$('[data-bg]').forEach(button => button.onclick = () => {
   $('#preview-stage-b').className = 'preview-stage ' + state.bg;
 });
 $('#clear-selection').onclick = () => {
+  if (!isSelectionReady || (!selected.size && !unavailableSelected.length)) return;
+  const hadDraftSelection = selected.size > 0;
   selected.clear();
   unavailableSelected = [];
   persist();
+  if (hadDraftSelection) partnerSelections?.changed();
+  syncDetailSelection();
   render();
 };
 $('#compare-btn').onclick = compareSelected;
@@ -1441,6 +1464,7 @@ $('#resource-variant').onchange = event => {
 };
 $('#detail-selected').onchange = event => {
   if (current) toggleSelection(current.id, event.target.checked);
+  syncDetailSelection();
 };
 $$('.close-modal').forEach(button => button.onclick = () => button.closest('dialog').close());
 $('#detail-modal').addEventListener('close', closeDetail);
@@ -1591,8 +1615,10 @@ $('#import-file').onchange = async event => {
     });
     if (!imported) return;
     Object.assign(reviews, imported.reviews);
+    const previousSelectionSize = selected.size;
     imported.selected.forEach(id => selected.add(id));
     persist();
+    if (selected.size !== previousSelectionSize) partnerSelections?.changed();
     if (current) {
       if (Object.hasOwn(imported.reviews, current.id)) {
         clearTimeout(commentTimer);
@@ -1600,7 +1626,7 @@ $('#import-file').onchange = async event => {
         updateReviewButtons();
         $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
       }
-      $('#detail-selected').checked = selected.has(current.id);
+      syncDetailSelection();
     }
     render();
     showToast(`已合并 ${Object.keys(imported.reviews).length} 条有效记录，忽略未知 ID；同一资产采用导入记录。`);
@@ -1611,7 +1637,7 @@ $('#import-file').onchange = async event => {
   }
 };
 function setDefaultPreview(value) {
-  const result = writeDefaultProfile(localStorage, value, profiles);
+  const result = writeDefaultProfile(browserStorage, value, profiles);
   defaultProfile = result.profileId;
   $('#default-profile').value = defaultProfile;
   $('#default-profile-note').textContent = result.saved ? '已记住此浏览器默认 · 卡片与详情视图 A 同步使用' : '本次已应用，但浏览器无法保存；刷新后会恢复默认';

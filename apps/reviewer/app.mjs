@@ -11,7 +11,7 @@ import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentit
 import { createPreviewQueue } from './shared/preview-queue.mjs';
 import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
-import { loadReviewState, saveReviewState } from './shared/selection-state.mjs';
+import { browserStorage, loadReviewState, saveReviewState } from './shared/selection-state.mjs';
 import { configureShell as mountShell, renderEvidenceSections } from './shared/shell-controller.mjs';
 import { getResourceResolver, mapResourceData, createProjectScope } from './shared/resource-url.mjs';
 const project = await guardStartup(() => loadProject());
@@ -213,7 +213,7 @@ function reviewOf(item) {
   };
 }
 function persist() {
-  storageOK = saveReviewState(localStorage, config, {
+  storageOK = saveReviewState(browserStorage, config, {
     reviews,
     selected,
     legacySelected
@@ -223,7 +223,7 @@ function persist() {
   return storageOK;
 }
 function loadState() {
-  const saved = loadReviewState(localStorage, config);
+  const saved = loadReviewState(browserStorage, config);
   reviews = saved.reviews;
   selected = new Set(saved.selected);
   legacySelected = saved.legacySelected;
@@ -425,7 +425,7 @@ async function init() {
       version: 1,
       flatCanopySourceMaterialIds: []
     };
-    defaultProfile = readDefaultProfile(localStorage, profiles);
+    defaultProfile = readDefaultProfile(browserStorage, profiles);
     profileA = defaultProfile;
     profileB = config.compareProfile || profiles.find(p => p.id !== profileA && p.implemented)?.id || profileA;
     items = [...objects, ...resources];
@@ -1604,7 +1604,7 @@ $('#restore-file').onchange = async event => {
     if (generation !== restoreGeneration || identity.some((value, index) => value !== [config.projectId, config.datasetId, config.reviewKey, config.sharedSelections, config.selectionStorageKey][index])) return;
     const snapshot = restoreReviewSnapshot({
       text, knownIds, parse: parseReviewImport,
-      config, storage: localStorage, confirmReplace: message => window.confirm(message)
+      config, storage: browserStorage, confirmReplace: message => window.confirm(message)
     });
     if (!snapshot) return;
     // Persist succeeded; only now replace memory and discard the old comment timer.
@@ -1629,7 +1629,7 @@ $('#restore-file').onchange = async event => {
   }
 };
 function setDefaultPreview(value) {
-  const result = writeDefaultProfile(localStorage, value, profiles);
+  const result = writeDefaultProfile(browserStorage, value, profiles);
   defaultProfile = result.profileId;
   $('#default-profile').value = defaultProfile;
   $('#default-profile-note').textContent = result.saved ? '已记住此浏览器默认 · 卡片与详情视图 A 同步使用' : '本次已应用，但浏览器无法保存；刷新后会恢复默认';
