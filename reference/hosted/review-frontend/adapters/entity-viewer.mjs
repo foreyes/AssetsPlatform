@@ -145,7 +145,7 @@ export async function createViewer(container, urlOrAsset, options = {}) {
     native = rt.createModelViewer(container, {
       ...(loadModel ? {loadModel} : {}),
       profile: baseProfile,
-      onError(value) { error = value; if (!disposed) options.onError?.(value); },
+      onError(value) { error = value; api.ready = false; if (!disposed) options.onError?.(value); },
       stageFactory(gltf, fullAsset, stageOptions) {
         const result = rt.createRenderStage(gltf, fullAsset, {...stageOptions, controlsFactory(nextCamera, canvas) {
           camera = nextCamera; orbit = new rt.OrbitControls(nextCamera, canvas); return orbit;
@@ -161,7 +161,7 @@ export async function createViewer(container, urlOrAsset, options = {}) {
     });
     const opened = await native.open(asset);
     retryRetired(); check(options.signal);
-    if (!opened || disposed) throw error || abortError();
+    if (!opened || disposed || error) throw error || abortError();
     if (options.camera) setCamera(options.camera);
     cameraSilent = false; api.ready = true; status.remove();
     return api;
@@ -181,7 +181,7 @@ export function createThumbnailRenderer({onInvalidate = () => {}} = {}) {
       unsubscribe ??= rt.subscribeContext(() => { if (!disposed) onInvalidate(); });
       const loadModel = modelLoader(rt, asset, options.resourceBaseUrl);
       const result = prepare
-        ? await rt.prepareModelResource(asset, {signal: controller.signal})
+        ? await rt.prepareModelResource(asset, {signal: controller.signal, automatic: true})
         : await rt.renderThumbnail(asset, {...(loadModel ? {loadModel} : {}), profile: profileFor(rt, options.profile), signal: controller.signal, onSnapshot: options.onSnapshot});
       check(controller.signal); check(options.signal); if (disposed) throw abortError();
       return result;

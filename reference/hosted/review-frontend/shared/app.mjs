@@ -1033,6 +1033,24 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     }
     if (request !== viewerRequest) return;
   }
+  const onViewerError = error => {
+    if (request !== viewerRequest || abort.signal.aborted || error?.code !== 'WEBGL_CONTEXT_LOST') return;
+    pausePlayback();
+    $('#preview-caption').textContent = error.message;
+    $('#animation-controls').hidden = true;
+    $('#wireframe-btn').hidden = true;
+    $('#reset-camera').hidden = true;
+    offerPreviewRetry();
+  };
+  const offerPreviewRetry = () => {
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.textContent = '重试实时预览';
+    retry.onclick = () => {
+      if (request === viewerRequest) startViewers();
+    };
+    stageA.append(retry);
+  };
   try {
     const modelUrl = animationRecord?.modelUrl || rendered.modelUrl;
     const a = await createViewer(stageA, modelUrl, {
@@ -1043,6 +1061,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
       signal: abort.signal,
       camera: previousCamera,
       animationData,
+      onError: onViewerError,
       onCameraChange: camera => syncCamera(camera, 'a')
     });
     if (request !== viewerRequest) {
@@ -1059,6 +1078,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
         signal: abort.signal,
         camera: a.getCamera?.(),
         animationData,
+        onError: onViewerError,
         onCameraChange: camera => syncCamera(camera, 'b')
       });
       if (request !== viewerRequest) {
@@ -1085,6 +1105,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     stageA.innerHTML = item.originalUrl || item.previewUrl ? imageHTML(item, true) : '';
     stageB.innerHTML = item.originalUrl || item.previewUrl ? imageHTML(item, true) : '';
     showPreviewFailure(stageA, failure);
+    if (error?.code === 'WEBGL_CONTEXT_LOST') offerPreviewRetry();
     if (comparison) showPreviewFailure(stageB, failure);
     $('#wireframe-btn').hidden = true;
     $('#reset-camera').hidden = true;
