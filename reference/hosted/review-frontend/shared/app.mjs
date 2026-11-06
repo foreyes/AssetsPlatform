@@ -476,6 +476,8 @@ async function init() {
     });
     if (config.capabilities.research) await buildResearch();
     if (config.capabilities.effects) await buildWeaponEffects();
+    isReviewImportReady = true;
+    $('#import-btn').disabled = $('#mobile-import').disabled = $('#audit-import').disabled = false;
   } catch (error) {
     $('#load-error').hidden = false;
     $('#load-error').textContent = `${error.message}。请刷新重试；已保留当前审阅记录。`;
@@ -1223,7 +1225,8 @@ function saveComment() {
   if (!current) return;
   const comment = $('#comment').value,
     old = reviewOf(current);
-  if (comment !== old.comment) {
+  // Textareas normalize line endings even when the user has not edited the text.
+  if (comment !== old.comment.replace(/\r\n?/g, '\n')) {
     reviews[current.id] = {
       ...old,
       comment,
@@ -1353,8 +1356,10 @@ function buildAudit() {
   button.onclick = () => exportJSON(true);
   content.append(button);
   const load = document.createElement('button');
+  load.id = 'audit-import';
   load.className = 'light-btn';
   load.textContent = '导入审阅记录';
+  load.disabled = !isReviewImportReady;
   load.onclick = () => $('#import-file').click();
   content.append(load);
 }
@@ -1530,6 +1535,7 @@ document.addEventListener('visibilitychange', () => {
   } else if (!$('#detail-modal').open) scheduleCardPreviews();
 });
 window.addEventListener('pagehide', () => {
+  invalidateReviewImport();
   resourceScope.invalidate();
   resourceAbort?.abort();
   hierarchyAbort?.abort();
@@ -1558,31 +1564,51 @@ window.addEventListener('pageshow', event => {
     if (current && $('#detail-modal').open) startViewers(false, false);else scheduleCardPreviews();
   }
 });
+let reviewImportGeneration = 0;
+let isReviewImportReady = false;
+function invalidateReviewImport() {
+  ++reviewImportGeneration;
+  $('#import-file').value = '';
+}
 $('#import-file').onchange = async event => {
+  const generation = ++reviewImportGeneration;
+  const { projectId, datasetId, reviewKey } = config;
+  const isCurrentImport = () => generation === reviewImportGeneration && projectId === config.projectId &&
+    datasetId === config.datasetId && reviewKey === config.reviewKey;
   const file = event.target.files[0];
   if (!file) return;
   try {
+    if (!isReviewImportReady) throw Error('资产目录尚未载入');
     if (file.size > config.importLimitMiB * 1024 * 1024) throw Error(`文件超过 ${config.importLimitMiB} MB，请使用本站导出的审阅 JSON`);
+    const text = await file.text();
+    if (!isReviewImportReady || !isCurrentImport()) return;
     const imported = importReviewBackup({
-      text: await file.text(),
+      text,
       knownIds: new Set(itemMap.keys()),
       parse: parseReviewImport,
       config,
       confirmLegacy: message => window.confirm(message)
     });
-    if (!imported) {
-      event.target.value = '';
-      return;
-    }
+    if (!imported) return;
     Object.assign(reviews, imported.reviews);
     imported.selected.forEach(id => selected.add(id));
     persist();
+    if (current) {
+      if (Object.hasOwn(imported.reviews, current.id)) {
+        clearTimeout(commentTimer);
+        $('#comment').value = reviewOf(current).comment;
+        updateReviewButtons();
+        $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
+      }
+      $('#detail-selected').checked = selected.has(current.id);
+    }
     render();
     showToast(`已合并 ${Object.keys(imported.reviews).length} 条有效记录，忽略未知 ID；同一资产采用导入记录。`);
   } catch (error) {
-    showToast('导入失败：' + error.message);
+    if (isCurrentImport()) showToast('导入失败：' + error.message);
+  } finally {
+    if (isCurrentImport()) event.target.value = '';
   }
-  event.target.value = '';
 };
 function setDefaultPreview(value) {
   const result = writeDefaultProfile(localStorage, value, profiles);
@@ -1775,6 +1801,7 @@ function configureShell() {
     },
     onDataset: changeDataset,
     onProjectLeave: () => {
+      invalidateReviewImport();
       resourceScope.invalidate();
       resourceAbort?.abort();
       hierarchyAbort?.abort();
@@ -1806,6 +1833,7 @@ function configureShell() {
 }
 function changeDataset(id) {
   if (!projectData.datasets?.[id] || id === activeLibraryDataset) return;
+  invalidateReviewImport();
   resourceScope.invalidate();
   resourceAbort?.abort();
   hierarchyAbort?.abort();

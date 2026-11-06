@@ -465,6 +465,8 @@ async function init() {
     });
     if (config.capabilities.research) await buildResearch();
     if (config.capabilities.effects) await buildWeaponEffects();
+    isReviewImportReady = true;
+    $('#import-btn').disabled = $('#mobile-import').disabled = $('#audit-import').disabled = false;
   } catch (error) {
     $('#load-error').hidden = false;
     $('#load-error').textContent = `${error.message}。请刷新重试；已保留当前审阅记录。`;
@@ -1205,7 +1207,8 @@ function saveComment() {
   if (!current) return;
   const comment = $('#comment').value,
     old = reviewOf(current);
-  if (comment !== old.comment) {
+  // Textareas normalize line endings even when the user has not edited the text.
+  if (comment !== old.comment.replace(/\r\n?/g, '\n')) {
     reviews[current.id] = {
       ...old,
       comment,
@@ -1334,8 +1337,10 @@ function buildAudit() {
   button.onclick = () => exportJSON(true);
   content.append(button);
   const load = document.createElement('button');
+  load.id = 'audit-import';
   load.className = 'light-btn';
   load.textContent = '导入审阅记录';
+  load.disabled = !isReviewImportReady;
   load.onclick = () => $('#import-file').click();
   content.append(load);
   const restore = document.createElement('button');
@@ -1548,15 +1553,17 @@ window.addEventListener('pageshow', event => {
   }
 });
 let restoreGeneration = 0;
+let isReviewImportReady = false;
 $('#import-file').onchange = async event => {
   const generation = ++restoreGeneration;
   const identity = [config.projectId, config.datasetId, config.reviewKey];
   const file = event.target.files[0];
   if (!file) return;
   try {
+    if (!isReviewImportReady) throw Error('资产目录尚未载入');
     if (file.size > config.importLimitMiB * 1024 * 1024) throw Error(`文件超过 ${config.importLimitMiB} MB，请使用本站导出的审阅 JSON`);
     const text = await file.text();
-    if (generation !== restoreGeneration || identity.some((value, index) => value !== [config.projectId, config.datasetId, config.reviewKey][index])) return;
+    if (!isReviewImportReady || generation !== restoreGeneration || identity.some((value, index) => value !== [config.projectId, config.datasetId, config.reviewKey][index])) return;
     const imported = importReviewBackup({
       text,
       knownIds: new Set(itemMap.keys()),
@@ -1564,19 +1571,26 @@ $('#import-file').onchange = async event => {
       config,
       confirmLegacy: message => window.confirm(message)
     });
-    if (!imported) {
-      event.target.value = '';
-      return;
-    }
+    if (!imported) return;
     Object.assign(reviews, imported.reviews);
     imported.selected.forEach(id => selected.add(id));
     persist();
+    if (current) {
+      if (Object.hasOwn(imported.reviews, current.id)) {
+        clearTimeout(commentTimer);
+        $('#comment').value = reviewOf(current).comment;
+        updateReviewButtons();
+        $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
+      }
+      $('#detail-selected').checked = selected.has(current.id);
+    }
     render();
     showToast(`已合并 ${Object.keys(imported.reviews).length} 条有效记录，忽略未知 ID；同一资产采用导入记录。`);
   } catch (error) {
-    showToast('导入失败：' + error.message);
+    if (generation === restoreGeneration) showToast('导入失败：' + error.message);
+  } finally {
+    if (generation === restoreGeneration) event.target.value = '';
   }
-  if (generation === restoreGeneration) event.target.value = '';
 };
 $('#restore-file').onchange = async event => {
   const generation = ++restoreGeneration;
