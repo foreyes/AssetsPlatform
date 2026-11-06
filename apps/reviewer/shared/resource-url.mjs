@@ -3,7 +3,9 @@
 
 const ORIGIN_FALLBACK='http://localhost';
 const abort=()=>new DOMException('Project resource request cancelled','AbortError');
-const beneath=(path,root)=>root==='/'?path.startsWith('/'):path.startsWith(root);
+// Compare decoded URL paths, matching the static servers' encoded aliases.
+const canonicalPath=value=>decodeURIComponent(value).replace(/\/+/g,'/');
+const beneath=(path,root)=>canonicalPath(path).startsWith(canonicalPath(root))||canonicalPath(path)===canonicalPath(root).replace(/\/$/,'');
 function safeReference(value){
  if(typeof value!=='string'||!value||/[\\\0-\x20\x7f]/.test(value)||value.startsWith('//'))throw Error('Unsafe resource reference');
  const beforeFragment=value.split('#',1)[0],path=beforeFragment.replace(/^https?:\/\/[^/]+/i,'').split('?',1)[0];
@@ -18,6 +20,16 @@ export function createResourceResolver({projectId='legacy',datasetId='verified',
  const fallback=origin||globalThis.location?.origin||ORIGIN_FALLBACK,root=directory(assetRoot||'./',fallback+'/'),site=root.origin;if(origin&&new URL(origin).origin!==site)throw Error('Project assetRoot must remain on the registered site');
  const external=new Set(externalOrigins.map(value=>{const u=new URL(value);if(u.protocol!=='https:'||u.username||u.password||u.pathname!=='/'||u.search||u.hash)throw Error('Exact HTTPS external origin required');return u.origin}));
  const otherRoots=registeredProjectRoots.map(value=>directory(value,root)).filter(u=>u.origin===site&&u.href!==root.href);
+ const owner=pathname=>[root,...otherRoots].filter(u=>beneath(pathname,u.pathname)).sort((a,b)=>canonicalPath(b.pathname).length-canonicalPath(a.pathname).length)[0];
+ const isOwn=pathname=>owner(pathname)&&canonicalPath(owner(pathname).pathname)===canonicalPath(root.pathname);
+ // Case folding can deny an alias on Windows, but must never grant a path
+ // outside the exact root on case-sensitive hosts. Ambiguous roots fail closed.
+ function rejectPathAlias(pathname){
+  // Apply to both declarations and resolved mounts; neither may grant an alias.
+  if(otherRoots.some(u=>canonicalPath(u.pathname)!==canonicalPath(root.pathname))&&canonicalPath(pathname).split('/').some(part=>part.includes(':')||/[. ]$/.test(part)||/~[0-9]+(?:\.|$)/i.test(part)))throw Error('Ambiguous filesystem resource alias denied');
+  const exact=owner(pathname),length=exact?canonicalPath(exact.pathname).length:0,folded=canonicalPath(pathname).toLowerCase();
+  if([root,...otherRoots].some(u=>(folded.startsWith(canonicalPath(u.pathname).toLowerCase())||folded===canonicalPath(u.pathname).toLowerCase().replace(/\/$/,''))&&(canonicalPath(u.pathname).length>length||canonicalPath(u.pathname).length===length&&canonicalPath(u.pathname)!==canonicalPath(exact.pathname))))throw Error('Cross-project case alias denied');
+ }
  const specs=resourceMounts||[{logicalPrefix:dataKind==='entity'?'/entity/':'/assets/',target:dataKind==='entity'?'./':'assets/'}];
  const mounts=specs.map(spec=>{if(!spec||typeof spec.logicalPrefix!=='string'||!/^\/(?:[A-Za-z0-9._-]+\/)+$/.test(spec.logicalPrefix)||spec.logicalPrefix.split('/').includes('..'))throw Error('Registered logical resource prefix required');const target=directory(spec.target||'./',root);if(target.origin!==site||!beneath(target.pathname,root.pathname))throw Error('Resource mount escapes project root');return {prefix:spec.logicalPrefix,target}}).sort((a,b)=>b.prefix.length-a.prefix.length);
  const native=new Set(),supplemental=new Map(),nativeModule=dataKind==='entity'&&nativeModuleBase?directory(nativeModuleBase,root):null;
@@ -32,16 +44,22 @@ export function createResourceResolver({projectId='legacy',datasetId='verified',
   if(raw.origin!==site){if(kind==='download')return externalLink(value);throw Error('External asset fetch is not permitted');}
   if(raw.search)throw Error('Local resource query is not permitted');
   if(kind==='native'){if(!native.has(raw.pathname)||raw.hash)throw Error('Unregistered native resource declaration');return raw.href;}
-  if(kind==='module'&&nativeModule&&beneath(raw.pathname,nativeModule.pathname)){if(raw.hash||!(/\.(?:mjs|js)$/.test(raw.pathname)))throw Error('Registered native JavaScript module required');return raw.href;}
-  if(otherRoots.some(u=>beneath(raw.pathname,u.pathname)&&!beneath(raw.pathname,root.pathname)))throw Error('Cross-project source path denied');
+  if(kind==='module'&&nativeModule&&raw.pathname.startsWith(nativeModule.pathname)){if(raw.hash||!(/\.(?:mjs|js)$/.test(raw.pathname)))throw Error('Registered native JavaScript module required');return raw.href;}
+  rejectPathAlias(raw.pathname);
+  const sourceOwner=owner(raw.pathname);
+  // Ancestor-owned logical aliases may be mounted into a child; sibling and
+  // descendant physical roots must be rejected before applying any mount.
+  if(sourceOwner&&!isOwn(raw.pathname)&&!beneath(root.pathname,sourceOwner.pathname))throw Error('Cross-project source path denied');
   let target=raw;
   // Already-resolved URLs within this project are idempotent. Logical absolute
   // prefixes are mapped only when they are outside its physical public root.
   if(!beneath(raw.pathname,root.pathname)){
-   const mapping=mounts.find(m=>raw.pathname.startsWith(m.prefix));if(!mapping)throw Error('Resource escapes the registered project root');
-   target=new URL(raw.pathname.slice(mapping.prefix.length)+raw.hash,mapping.target);
+   const mapping=mounts.find(m=>canonicalPath(raw.pathname).startsWith(m.prefix));if(!mapping)throw Error('Resource escapes the registered project root');
+   const suffix=raw.pathname.replace(/\/+/g,'/').split('/').slice(mapping.prefix.split('/').length-1).join('/');
+   target=new URL(suffix+raw.hash,mapping.target);
   }
-  if(target.origin!==site||!beneath(target.pathname,root.pathname)||otherRoots.some(u=>beneath(target.pathname,u.pathname)&&u.pathname!==root.pathname))throw Error('Cross-project resource access denied');
+  rejectPathAlias(target.pathname);
+  if(target.origin!==site||!beneath(target.pathname,root.pathname)||!isOwn(target.pathname))throw Error('Cross-project resource access denied');
   return target.href;
  }
  function link(value){if(value==null||value==='')return value;const u=new URL(value,root);return resolve(value,{kind:u.origin===site?'evidence':'download'});}

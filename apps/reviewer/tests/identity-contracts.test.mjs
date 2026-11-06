@@ -33,3 +33,69 @@ test('successful bootstrap binds stable identity and validates unique storage',a
 test('dataset aliases accept only the identical existing record, before UI merge',()=>{const d=catalog(),base=d.catalog.assets[0];d.datasets={verified:{resources:[base]},adapter:{resources:[{id:'extra',name:'Extra'}]}};validateCatalogData(d);d.datasets.adapter.resources=[{...base,name:'Conflicting alternate'}];assert.throws(()=>validateCatalogData(d),/datasets.adapter.*conflicting/);d.datasets.adapter.resources=[{id:'constructor',name:'Unsafe'}];assert.throws(()=>validateCatalogData(d),/datasets.adapter.*safe/);d.datasets.adapter.resources=[base,base];assert.throws(()=>validateCatalogData(d),/duplicate dataset/)});
 test('other project roots derive from descriptors even without directory hints',async()=>{const a=descriptor('a'),b=descriptor('b');b.assetRoot='./b/';const files={'project-directory.json':{defaultProject:'a',projects:[{id:'a',config:'a.json'},{id:'b',config:'b.json'}]},'a.json':a,'b.json':b};const p=await loadProject({location:{href:'http://localhost/',search:''},fetchJSON:async url=>files[new URL(url).pathname.slice(1)]});assert.deepEqual(p.config.registeredProjectRoots,['http://localhost/b/']);assert.throws(()=>p.config.resourceResolver.resolve('/b/assets/other.glb'));assert.equal(p.config.resourceResolver.resolve('/assets/own.glb'),'http://localhost/assets/own.glb');files['project-directory.json'].projects[1].assetRoot='./wrong/';await assert.rejects(loadProject({location:{href:'http://localhost/',search:''},fetchJSON:async url=>files[new URL(url).pathname.slice(1)]}),/root differs/)});
 test('default descriptor fetch rejects redirects and is byte bounded',async()=>{const old=globalThis.fetch,calls=[];globalThis.fetch=async(url,options)=>{calls.push(options);return new Response(JSON.stringify(String(url).endsWith('project-directory.json')?{defaultProject:'a',projects:[{id:'a',config:'a.json'}]}:descriptor('a')))};try{await loadProject({location:{href:'http://localhost/',search:''}});assert.equal(calls.length,2);assert(calls.every(options=>options.redirect==='error'));globalThis.fetch=async()=>new Response('{}',{headers:{'content-length':String(3*1024*1024)}});await assert.rejects(loadProject({location:{href:'http://localhost/',search:''}}),/budget exceeded/)}finally{globalThis.fetch=old}});
+
+for (const mode of ['public', 'hosted']) test(mode + ' resolver and loader assign decoded paths to the most specific registered root', async () => {
+  const folder = mode === 'public' ? new URL('../shared/', import.meta.url) : new URL('../../../reference/hosted/review-frontend/shared/', import.meta.url);
+  let source = await fs.readFile(new URL('resource-url.mjs', folder), 'utf8');
+  // The private hosted pins are absent here; no supplemental capability is issued.
+  source = source.replace(/import .* from '.\/entity-supplemental-pins.mjs';/, 'const supplementalPin=()=>null, supplementalRoot=()=>{throw Error("unregistered")};');
+  const resolverURL = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
+  const {createResourceResolver} = await import(resolverURL);
+  const roots = ['/', '/b/', '/b/grand/', '/sibling/'];
+  for (const current of roots) {
+    const resolver = createResourceResolver({assetRoot:'http://localhost'+current, registeredProjectRoots:roots.map(r=>'http://localhost'+r)});
+    assert.equal(resolver.resolve('assets/own.glb'), 'http://localhost'+current+'assets/own.glb');
+    assert.equal(resolver.resolve('/assets/own.glb'), 'http://localhost'+current+'assets/own.glb');
+    assert.equal(resolver.resolve('http://localhost'+current+'assets/own.glb'), 'http://localhost'+current+'assets/own.glb');
+    for (const other of roots.filter(r=>r!==current)) assert.throws(()=>resolver.resolve(other+'physical.glb'), /Cross-project|escapes/);
+  }
+  const parent=createResourceResolver({assetRoot:'http://localhost/',registeredProjectRoots:['http://localhost/b/']});
+  assert.throws(()=>parent.resolve('/%62/secret.glb'), /Cross-project/);
+  assert.throws(()=>parent.resolve('/B/secret.glb'), /Cross-project/);
+  for(const url of ['/b','/b. /secret.glb','/b./secret.glb','/b%2e/secret.glb','/B./secret.glb','/b%20/secret.glb','/LONGPR~1/secret.glb'])assert.throws(()=>parent.resolve(url));
+  assert.throws(()=>parent.link('/b'));
+  assert.throws(()=>parent.link('/B'));
+  for(const url of ['/b::$INDEX_ALLOCATION/secret.glb','/b%3A%3A$INDEX_ALLOCATION/secret.glb','/Q:/b/secret.glb','/Q%3a/b/secret.glb','/Q:discard/b/secret.glb','/0:/b/secret.glb','/%F0%9F%98%80%3Adiscard/b/secret.glb'])assert.throws(()=>parent.resolve(url),/alias/);
+  const driveMount=createResourceResolver({assetRoot:'http://localhost/',registeredProjectRoots:['http://localhost/b/'],resourceMounts:[{logicalPrefix:'/alias/',target:'./Q:/'}]});
+  // Root projects retain physical-path idempotence; use a child for a real mount.
+  const childDriveMount=createResourceResolver({assetRoot:'http://localhost/p/',registeredProjectRoots:['http://localhost/','http://localhost/p/b/'],resourceMounts:[{logicalPrefix:'/alias/',target:'./Q:/'}]});
+  assert.throws(()=>childDriveMount.resolve('/alias/b/secret.glb'),/alias/);
+  for(const target of ['./Q:discard/','./0:/','./😀:discard/']){
+    const mounted=createResourceResolver({assetRoot:'http://localhost/p/',registeredProjectRoots:['http://localhost/','http://localhost/p/b/'],resourceMounts:[{logicalPrefix:'/alias/',target}]});
+    assert.throws(()=>mounted.resolve('/alias/b/secret.glb'),/alias/);
+  }
+  const modules=createResourceResolver({assetRoot:'http://localhost/project/',registeredProjectRoots:['http://localhost/entity/'],dataKind:'entity',nativeModuleBase:'/entity/'});
+  assert.equal(modules.resolve('/entity/viewer.js',{kind:'module'}),'http://localhost/entity/viewer.js');
+  assert.throws(()=>modules.resolve('/%65ntity/viewer.js',{kind:'module'}));
+  assert.throws(()=>driveMount.resolve('/Q:/b/secret.glb'),/alias/);
+
+  const nested=createResourceResolver({assetRoot:'http://localhost/b/',registeredProjectRoots:['http://localhost/','http://localhost/b/grand/']});
+  assert.throws(()=>nested.resolve('/%2562/secret.glb'));
+  assert.throws(()=>nested.resolve('/b//grand/secret.glb'), /Cross-project/);
+  for(const target of ['grand./','grand%20/','GRAND~1/']){
+    const mounted=createResourceResolver({assetRoot:'http://localhost/b/',registeredProjectRoots:['http://localhost/','http://localhost/b/grand/'],resourceMounts:[{logicalPrefix:'/alias/',target}]});
+    assert.throws(()=>mounted.resolve('/alias/secret.glb'),/alias/);
+    assert.throws(()=>mounted.resolve('http://localhost/b/'+target+'secret.glb'),/alias/);
+  }
+  assert.equal(nested.resolve('/b//assets/own.glb'),'http://localhost/b//assets/own.glb');
+  const upper=createResourceResolver({assetRoot:'http://localhost/B/',registeredProjectRoots:['http://localhost/']});
+  assert.equal(upper.resolve('own.glb'),'http://localhost/B/own.glb');
+  assert.throws(()=>upper.resolve('/b/own.glb'),/Cross-project/);
+  const child=createResourceResolver({assetRoot:'http://localhost/b/',registeredProjectRoots:['http://localhost/','http://localhost/sibling/'],resourceMounts:[{logicalPrefix:'/sibling/',target:'assets/'},{logicalPrefix:'/assets/',target:'assets/'}]});
+  assert.throws(()=>child.resolve('/sibling/secret.glb'), /Cross-project/);
+  assert.equal(child.resolve('/assets/own.glb'),'http://localhost/b/assets/own.glb');
+  assert.equal(child.resolve('/%61ssets/part%23one.glb'),'http://localhost/b/assets/part%23one.glb');
+  const equal=createResourceResolver({assetRoot:'http://localhost/b/',registeredProjectRoots:['http://localhost/b/']});
+  assert.equal(equal.resolve('asset.glb'),'http://localhost/b/asset.glb');
+  assert.equal(equal.resolve('literal~1.glb'),'http://localhost/b/literal~1.glb');
+  assert.equal(equal.resolve('./literal:name.glb'),'http://localhost/b/literal:name.glb');
+  assert.equal(equal.resolve('folder./asset.glb'),'http://localhost/b/folder./asset.glb');
+  let loader=await fs.readFile(new URL('project-loader.mjs',folder),'utf8');
+  loader=loader.replace(/from '(\.\/[^']+)'/g,(_,relative)=>'from '+JSON.stringify(relative==='./resource-url.mjs'?resolverURL:new URL(relative,folder).href));
+  const {loadProject:load}=await import('data:text/javascript;base64,'+Buffer.from(loader).toString('base64'));
+  const a=descriptor('a'),b=descriptor('b');b.assetRoot='./b/';
+  const files={'project-directory.json':{defaultProject:'b',projects:[{id:'a',config:'a.json'},{id:'b',config:'b.json'}]},'a.json':a,'b.json':b};
+  const project=await load({location:{href:'http://localhost/',search:''},fetchJSON:async url=>files[new URL(url).pathname.slice(1)]});
+  assert.equal(project.config.resourceResolver.resolve('/assets/own.glb'),'http://localhost/b/assets/own.glb');
+  assert.throws(()=>project.config.resourceResolver.resolve('/physical.glb'));
+});

@@ -4,7 +4,7 @@
 
 ## 目录登记与身份
 
-根 `project-directory.json` 包含 schema、defaultProject 与 projects。每个项目至少有唯一 id、label、config、assetRoot。config 为同源配置路径；assetRoot 相对配置文件解析，不能跨入其他已登记项目的资源根。
+根 `project-directory.json` 包含 schema、defaultProject 与 projects。每个项目至少有唯一 id、label、config、assetRoot。config 为同源配置路径；assetRoot 相对配置文件解析；嵌套资源根按最具体的登记根归属，父项目不能读取子根，子项目也不能直接读取父级或兄弟项目的资源。
 
 ```json
 {
@@ -44,6 +44,8 @@ my-project/
 - `render-profiles.json`：渲染说明；代码对这一读取允许缺省，但完整模板仍应提供。实际通用参数定义在 `shared/common-render-profiles.mjs`。说明文本不能自动创造不存在的渲染算法。
 
 modelUrl 相对项目资源根，例如 `assets/models/example.glb`。资源 URL 必须经过解析器，不以展示来源链接代替实际可读取模型 URL。来源链接不自动赋予读取/分发权限。
+
+浏览器解析器按 URL 路径单次解码比较归属，保留正常逻辑挂载与同项目绝对地址。存在不同登记根时，路径段含冒号（包括 NTFS 目录流、盘符别名）、末尾点或空格、短文件名别名，以及可能混淆归属的大小写路径会被拒绝；这些规则只用于拒绝歧义，不扩大读取范围。只有单一或相同资源根时，仍允许这些普通文件名。原生资源与补充资源继续使用各自的显式能力声明。此为浏览器 URL 策略，不替代静态服务器的文件系统访问控制。
 
 ## 模型和能力
 
