@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawn,spawnSync} from 'node:child_process';
+import {spawnSync} from 'node:child_process';
 import {importDirectory} from '../scripts/import-directory.mjs';
+import {startLocalTestServer} from '../scripts/local-test-server.mjs';
 import {loadProject,loadProjectData} from '../apps/reviewer/shared/project-loader.mjs';
 import {parseGLB} from '../apps/reviewer/viewer.mjs';
 import {createWorkbench} from '../apps/reviewer/shared/workbench.mjs';
@@ -23,15 +24,21 @@ test('standalone imported workspace loads through real HTTP, loader, adapter and
   assert(!fs.existsSync(path.join(x.output,'demo-a')));assert(!fs.existsSync(path.join(x.output,'secret.txt')));
   const manifest=JSON.parse(fs.readFileSync(path.join(x.output,'import-report.json')));assert.equal(manifest.files[0].relative,'nested/彩色 cube.GLB');
   const port=30000+Math.floor(Math.random()*20000);
-  server=spawn(process.execPath,['server.mjs'],{cwd:x.output,env:{...process.env,PORT:String(port)},stdio:['ignore','pipe','pipe']});
-  await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server timeout')),5000);server.stdout.once('data',()=>{clearTimeout(timer);resolve();});server.once('exit',c=>{clearTimeout(timer);reject(Error('server exit '+c));});});
+  server=startLocalTestServer('server.mjs',{cwd:x.output,port});
+  await server.waitUntilReady();
   const base=`http://127.0.0.1:${port}/`;const fetchJSON=async url=>{const r=await fetch(url);assert.equal(r.status,200,url);return r.json();};
   const project=await loadProject({fetchJSON,location:{href:base,search:''}});assert.equal(project.config.projectId,x.id);assert.equal(project.config.datasetId,report.datasetId);
   const data=await loadProjectData(project,fetchJSON);assert.equal(data.catalog.assets.length,1);assert.equal(data.objectCatalog.objects.length,1);
   const model=data.catalog.assets[0];assert(model.triangleCount>0);assert(model.vertexCount>0);assert.equal((await fetch(base+'library/assets/preview-pending.svg')).status,200);const url=project.config.resourceResolver.resolve(model.modelUrl);const response=await fetch(url);assert.equal(response.status,200);assert(parseGLB(await response.arrayBuffer()).triangles>0);
   const html=await (await fetch(base)).text();assert(html.includes('ASSET REVIEW'));
   for (const relative of ['app.mjs','viewer.mjs','shared/project-loader.mjs','adapters/indexed-data.mjs','style.css']) assert.equal((await fetch(base+relative)).status,200);
- } finally {if(server){server.kill();await new Promise(resolve=>server.once('exit',resolve));}clean(x);}
+ } finally {
+  try {
+   await server?.stop();
+  } finally {
+   clean(x);
+  }
+ }
 });
 test('same input preserves identity, content changes isolate dataset and review keys',()=>{
  const x=setup();try {

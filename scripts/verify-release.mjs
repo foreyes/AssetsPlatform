@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawnSync,spawn} from 'node:child_process';
+import {spawnSync} from 'node:child_process';
 import assert from 'node:assert/strict';
+import {startLocalTestServer} from './local-test-server.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const app=path.join(root,'apps/reviewer');
 const check=spawnSync(process.execPath,['verify.mjs'],{cwd:app,encoding:'utf8'});
@@ -27,18 +28,14 @@ for(const p of all){
  if(p.endsWith('.glb'))assert(p.startsWith(app+path.sep),'only own demo GLBs');
 }
 const port=30000+Math.floor(Math.random()*20000);
-const server=spawn(process.execPath,[path.join(app,'server.mjs')],{env:{...process.env,PORT:String(port)},stdio:['ignore','pipe','pipe']});
+const server=startLocalTestServer(path.join(app,'server.mjs'),{port});
 try{
- await new Promise((resolve,reject)=>{
-  const timeout=setTimeout(()=>reject(Error('local server startup timeout')),5000);
-  server.stdout.once('data',()=>{clearTimeout(timeout);resolve();});
-  server.once('exit',code=>{clearTimeout(timeout);reject(Error('server exited '+code));});
- });
+ await server.waitUntilReady();
  const base=`http://127.0.0.1:${port}`;
  let res=await fetch(base+'/');assert.equal(res.status,200);assert((await res.text()).includes('ASSET REVIEW'));
  res=await fetch(base+'/project-directory.json');assert.equal((await res.json()).projects.length,2);
  res=await fetch(base+'/demo-a/assets/cube.glb',{method:'HEAD'});assert.equal(res.status,200);assert.equal((await res.arrayBuffer()).byteLength,0);
  res=await fetch(base+'/',{method:'POST'});assert.equal(res.status,405);
  res=await fetch(base+'/missing.json');assert.equal(res.status,404);
-}finally{server.kill();await new Promise(resolve=>server.once('exit',resolve));}
+}finally{await server.stop();}
 console.log(JSON.stringify({passed:true,appVerification:JSON.parse(check.stdout),sampleGLBParses:2,documentLinksChecked:links,files:all.length,localHTTP:['GET index','GET directory','HEAD model','reject POST','missing 404'],hostedBackendBuild:'not-run-reference-only',gpu:'not-run',networkDependencyAudit:'not-comprehensive'}));

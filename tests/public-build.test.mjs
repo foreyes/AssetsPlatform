@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
@@ -24,7 +25,7 @@ test('public build is deterministic, allowlisted and explicitly backend-free',()
 });
 
 test('isolated build refuses symlink inputs and outputs, and never copies unlisted data',()=>{
- const sandbox=fs.mkdtempSync('/tmp/public-build-test-');
+ const sandbox=fs.mkdtempSync(path.join(os.tmpdir(),'public-build-test-'));
  try {
   fs.mkdirSync(path.join(sandbox,'scripts'));
   fs.mkdirSync(path.join(sandbox,'apps/reviewer'),{recursive:true});
