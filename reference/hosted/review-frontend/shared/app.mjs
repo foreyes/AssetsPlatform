@@ -11,7 +11,7 @@ import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentit
 import { createPreviewQueue } from './shared/preview-queue.mjs';
 import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
-import { browserStorage, loadReviewState, saveReviewState } from './shared/selection-state.mjs';
+import { browserStorage, loadReviewState, createReviewWriter } from './shared/selection-state.mjs';
 import { configureShell as mountShell, renderEvidenceSections } from './shared/shell-controller.mjs';
 import { getResourceResolver, mapResourceData, createProjectScope } from './shared/resource-url.mjs';
 const project = await guardStartup(() => loadProject());
@@ -221,13 +221,36 @@ function reviewOf(item) {
     comment: ''
   };
 }
-function persist() {
-  storageOK = saveReviewState(browserStorage, config, {
-    reviews,
-    selected: [...selected, ...unavailableSelected],
-    legacySelected
-  });
+let reviewWriter, commentDirty = false, commentBaseline = '';
+function persist(intent) {
+  const expectedSelection = new Set(selected);
+  if (intent.selection?.clear) expectedSelection.clear();
+  for (const id of intent.selection?.add || []) expectedSelection.add(id);
+  for (const id of intent.selection?.remove || []) expectedSelection.delete(id);
+  const previousRows = state.view === 'selected' || state.view === 'reviewed' ? filterItems() : null;
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const saved = reviewWriter.save(intent, {reviews, selected: [...selected, ...unavailableSelected], legacySelected});
+  const known = new Set(itemMap.keys());
+  reviews = sanitizeReviews(saved.reviews, projectData?.kind === 'entity' && !projectData.datasets.adapter ? new Set(Object.keys(saved.reviews)) : known);
+  selected = new Set(saved.selected.filter(id => known.has(id)));
+  unavailableSelected = projectData?.kind === 'entity' && !projectData.datasets.adapter ? saved.selected.filter(id => !known.has(id)) : [];
+  legacySelected = saved.legacySelected;
+  storageOK = saved.ok;
   $('#storage-warning').hidden = storageOK;
+  const selectionRebased = selected.size !== expectedSelection.size || [...selected].some(id => !expectedSelection.has(id));
+  const currentRows = previousRows && filterItems();
+  if (previousRows && (selectionRebased || state.view === 'reviewed') && (previousRows.length !== currentRows.length || previousRows.some((item, index) => item !== currentRows[index]))) {
+    render();
+  } else if (selectionRebased) {
+    // Keep existing cards (and keyboard focus) when only selection decoration changed.
+    $$('.asset-card').forEach(card => {
+      const checked = selected.has(card.dataset.id);
+      card.querySelector('.card-check').checked = checked;
+      card.classList.toggle('selected', checked);
+    });
+    renderStats();
+  }
+  if (selectionRebased && current) $('#detail-selected').checked = selected.has(current.id);
   return storageOK;
 }
 function loadState() {
@@ -750,9 +773,8 @@ function goToPage(requestedPage) {
 }
 function toggleSelection(id, on) {
   if (!isSelectionReady || selected.has(id) === on) return;
-  if (on) selected.add(id);else selected.delete(id);
-  persist();
-  partnerSelections?.changed();
+  persist({selection: on ? {add: [id]} : {remove: [id]}});
+  partnerSelections?.changed(on ? {add: [id]} : {remove: [id]});
   syncDetailSelection();
   renderStats();
 }
@@ -1162,6 +1184,8 @@ async function openDetail(item) {
     if (related?.isObject) openDetail(related);
   });
   $('#comment').value = reviewOf(item).comment || '';
+  commentBaseline = $('#comment').value;
+  commentDirty = false;
   updateReviewButtons();
   $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
   $('#preview-disclaimer').textContent = item.isObject ? '按原始 renderer → material → texture 引用组合，不靠同名猜配。贴图、透明裁切与支持的材质参数可显示；游戏脚本、风、粒子与原 Unity 光照未重现。动画只在验证通过时提供播放器。' : item.type === 'program' ? '这是反编译重建的 C# 文本，不是原始项目源码。只做静态阅读，未执行原 DLL/EXE。' : item.type === 'animation' ? '这是动画元数据，不提供播放，不虚构与完整物件的绑定。' : item.type === 'material' ? '关联贴图仅用于溯源，不是材质球渲染。请在完整物件里查看材质与几何组合。' : '当前是独立技术资源；独立白模不包含完整原材质组合。项目渲染模式仅用于光照检视，完整效果请回到“完整物件”。';
@@ -1276,19 +1300,12 @@ function updateReviewButtons() {
 }
 function saveComment() {
   clearTimeout(commentTimer);
-  if (!current) return;
-  const comment = $('#comment').value,
-    old = reviewOf(current);
-  // Textareas normalize line endings even when the user has not edited the text.
-  if (comment !== old.comment.replace(/\r\n?/g, '\n')) {
-    reviews[current.id] = {
-      ...old,
-      comment,
-      updatedAt: new Date().toISOString()
-    };
-    persist();
-    $('#save-status').textContent = storageOK ? '✓ 已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
-  }
+  if (!current || !commentDirty) return;
+  commentDirty = false;
+  if ($('#comment').value === commentBaseline) return;
+  commentBaseline = $('#comment').value;
+  persist({patch: {id: current.id, comment: commentBaseline, updatedAt: new Date().toISOString()}});
+  $('#save-status').textContent = storageOK ? '✓ 已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
 }
 function closeDetail() {
   hierarchyAbort?.abort();
@@ -1483,10 +1500,8 @@ $$('[data-bg]').forEach(button => button.onclick = () => {
 $('#clear-selection').onclick = () => {
   if (!isSelectionReady || (!selected.size && !unavailableSelected.length)) return;
   const hadDraftSelection = selected.size > 0;
-  selected.clear();
-  unavailableSelected = [];
-  persist();
-  if (hadDraftSelection) partnerSelections?.changed();
+  persist({selection: {clear: true}});
+  if (hadDraftSelection) partnerSelections?.changed({clear: true});
   syncDetailSelection();
   render();
 };
@@ -1521,17 +1536,13 @@ $('#compare-modal').addEventListener('close', () => {
 $$('.review-buttons button').forEach(button => button.onclick = () => {
   if (!current) return;
   saveComment();
-  reviews[current.id] = {
-    ...reviewOf(current),
-    status: button.dataset.status,
-    updatedAt: new Date().toISOString()
-  };
-  persist();
+  persist({patch: {id: current.id, status: button.dataset.status, updatedAt: new Date().toISOString()}});
   updateReviewButtons();
   renderStats();
   $('#save-status').textContent = storageOK ? '✓ 审阅结论已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
 });
 $('#comment').oninput = () => {
+  commentDirty = true;
   clearTimeout(commentTimer);
   $('#save-status').textContent = '正在保存…';
   commentTimer = setTimeout(saveComment, 350);
@@ -1657,17 +1668,17 @@ $('#import-file').onchange = async event => {
       confirmLegacy: message => window.confirm(message)
     });
     if (!imported) return;
-    Object.assign(reviews, imported.reviews);
     const previousSelectionSize = selected.size;
-    imported.selected.forEach(id => selected.add(id));
-    const isSaved = persist();
+    const isSaved = persist({reviews: imported.reviews, selection: {add: imported.selected}});
     const hasDraftChanges = config.sharedSelections && selected.size !== previousSelectionSize;
     const isDraftSaved = !config.sharedSelections || !imported.selected.length ||
-      (hasDraftChanges ? partnerSelections.changed() : partnerSelections.saveDraft());
+      (hasDraftChanges ? partnerSelections.changed({add: imported.selected}) : partnerSelections.saveSelection({add: imported.selected}));
     if (current) {
       if (Object.hasOwn(imported.reviews, current.id)) {
         clearTimeout(commentTimer);
         $('#comment').value = reviewOf(current).comment;
+        commentBaseline = $('#comment').value;
+        commentDirty = false;
         updateReviewButtons();
         $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
       }

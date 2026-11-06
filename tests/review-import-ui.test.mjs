@@ -81,7 +81,7 @@ class Element {
 let fixtureId = 0;
 async function boot(t, mode, {
   shared = false, sharedSession, sharedList, responses = {}, storageError, initialSelection,
-  catalogAssets = [], catalogObjects = [asset], createViewer, downloadResource
+  catalogAssets = [], catalogObjects = [asset], createViewer, downloadResource, storageValues
 } = {}) {
   const root = reviewer[mode];
   const appRoot = mode === 'hosted' ? new URL('shared/', root) : root;
@@ -133,7 +133,7 @@ async function boot(t, mode, {
     return button;
   });
   const windowEvents = new Map();
-  const values = new Map([[config.reviewKey, JSON.stringify({
+  const values = storageValues || new Map([[config.reviewKey, JSON.stringify({
     version: 1, projectId: config.projectId, datasetId: config.datasetId,
     reviews: { [asset.id]: oldReview }, selected: []
   })]]);
@@ -261,7 +261,7 @@ async function boot(t, mode, {
       const moduleRoot = path === './shared/resource-url.mjs' ? reviewer.public : root;
       return 'from ' + JSON.stringify(new URL(path, moduleRoot).href);
     })
-    .replace(/init\(\);\s*$/, 'export const ready = init(); export { itemMap, reviews, selected, openDetail, openResource };');
+    .replace(/init\(\);\s*$/, 'export const ready = init(); export { itemMap, reviews, selected, openDetail, openResource, changeView };');
   const environment = 'const { setTimeout, clearTimeout, console } = globalThis.__importFixture;\n';
   const app = await import('data:text/javascript;base64,' + Buffer.from(environment + script).toString('base64') + '#' + ++fixtureId);
   const backup = (extra = {}) => JSON.stringify({
@@ -278,7 +278,18 @@ async function boot(t, mode, {
   const dispatch = event => windowEvents.get(event)?.forEach(run => run({ persisted: true }));
   return {
     app, get, config, buttons, calls, values, stored, requests, choose, backup, dispatch, downloads, confirmations, alerts,
+    activate() {
+      for (const [name, value] of Object.entries(bindings)) {
+        const property = name === 'localStorage' ? {get() {
+          if (storageError === 'getter') throw Error('Storage getter blocked');
+          return value;
+        }} : {value};
+        Object.defineProperty(globalThis, name, {...property, configurable: true});
+      }
+    },
     cardCheckbox: () => cards[0].querySelector('.card-check'),
+    card: id => cards.find(card => card.dataset.id === id),
+    visibleIds: () => cards.map(card => card.dataset.id),
     setStorageError: error => { storageError = error; },
     acceptConfirmation: value => { acceptConfirmation = value; },
     ready: async () => {
@@ -371,7 +382,7 @@ for (const mode of Object.keys(reviewer)) {
     const firstResult = h.toast();
     assert.match(firstResult, /当前页面合并 1 条有效记录.*未能完整保存.*导出备份/);
     assert.equal(h.stored().reviews[asset.id].comment, oldReview.comment);
-    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.calls, [h.config.selectionStorageKey]);
 
     h.get('#mobile-audit').onclick();
     h.setStorageError(h.config.selectionStorageKey);
@@ -380,7 +391,7 @@ for (const mode of Object.keys(reviewer)) {
     const auditResult = h.get('#audit-import-status').textContent;
     assert.match(auditResult, /当前页面合并 1 条有效记录.*未能完整保存.*导出备份/);
     assert.equal(h.stored().reviews[asset.id].comment, incomingReview.comment);
-    assert.equal(h.values.get(h.config.selectionStorageKey), '[]');
+    assert.equal(h.values.get(h.config.selectionStorageKey), JSON.stringify([asset.id]));
     assert.equal(h.get('#storage-warning').hidden, false);
 
     h.get('#export-all').onclick();
@@ -938,7 +949,7 @@ test('hosted keeps account storage warnings separate from acknowledged server su
   assert.equal(warning.hidden, false);
   await control('publish').onclick();
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(control('status').textContent, /已发布 1 项/);
+  assert.match(control('status').textContent, /已发布提交时的 1 项.*草稿未能同步确认/);
   assert.match(control('lists').textContent, /Post-publish refresh failed/);
   assert.equal(warning.hidden, false);
   assert.match(warning.textContent, /无法读取或保存账号草稿/);
@@ -1062,4 +1073,526 @@ test('public oversized report warns before download; oversized UTF-8 state refus
   assert.equal(h.downloads.length, 0); assert.match(h.alerts[0], /未导出可恢复备份/);
   h.get('#export-all').onclick();
   assert.equal(h.downloads.length, 1); assert.match(h.alerts[1], /不能用于恢复/);
+});
+
+for (const mode of Object.keys(reviewer)) {
+  test(`${mode} rebases stale editor fields and selections without resaving untouched text`, async t => {
+    const h = await boot(t, mode, { catalogObjects: [asset, {id: 'two', name: 'Second'}] });
+    await h.ready();
+    await h.app.openDetail(h.app.itemMap.get(asset.id));
+    const otherTab = h.stored();
+    otherTab.reviews[asset.id] = {status: 'keep', comment: 'Other tab comment'};
+    otherTab.reviews.two = {status: 'skip', comment: 'Other record'};
+    otherTab.reviews.unavailable = {status: 'check', comment: 'Preserved outside UI'};
+    otherTab.selected = ['two', 'unavailable'];
+    h.values.set(h.config.reviewKey, JSON.stringify(otherTab));
+    h.buttons[1].onclick();
+    assert.equal(h.stored().reviews[asset.id].comment, 'Other tab comment');
+    assert.equal(h.stored().reviews[asset.id].status, 'check');
+    assert.deepEqual(h.stored().reviews.two, otherTab.reviews.two);
+    h.get('#detail-selected').onchange({target: {checked: true}});
+    assert.deepEqual(new Set(h.stored().selected), new Set(['one', 'two', 'unavailable']));
+    assert.equal(h.app.selected.has('unavailable'), false);
+    h.get('#detail-modal').close();
+    assert.equal(h.stored().reviews[asset.id].comment, 'Other tab comment');
+    assert.deepEqual(h.stored().reviews.unavailable, otherTab.reviews.unavailable);
+    await h.app.openDetail(h.app.itemMap.get(asset.id));
+    h.edit('Trailing text');
+    h.dispatch('pagehide');
+    assert.equal(h.stored().reviews[asset.id].comment, 'Trailing text');
+    assert.equal(h.stored().reviews[asset.id].status, 'check');
+  });
+
+  test(`${mode} retries only failed key fragments and preserves unreadable bytes`, async () => {
+    const {createReviewWriter, loadReviewState} = await import(new URL('shared/selection-state.mjs', reviewer[mode]));
+    const config = {reviewKey: 'review', selectionStorageKey: 'selection', sharedSelections: false};
+    const values = new Map([['review', JSON.stringify({version: 1, reviews: {}, selected: []})], ['selection', '[]']]);
+    let failedKey = 'selection';
+    const storage = {getItem: key => values.get(key), setItem: (key, value) => {
+      if (key === failedKey) throw Error('quota');
+      values.set(key, value);
+    }};
+    const a = createReviewWriter(storage, config), b = createReviewWriter(storage, config);
+    let state = loadReviewState(storage, config);
+    state = a.save({reviews: {one: incomingReview}, selection: {add: ['one']}}, state);
+    assert.equal(state.ok, false);
+    failedKey = undefined;
+    b.save({patch: {id: 'one', comment: 'Newer tab'}}, loadReviewState(storage, config));
+    state = a.save({patch: {id: 'two', status: 'skip'}}, state);
+    assert.equal(state.ok, true);
+    assert.equal(JSON.parse(values.get('review')).reviews.one.comment, 'Newer tab');
+    assert.deepEqual(JSON.parse(values.get('selection')), ['one']);
+
+    values.set('review', '{broken');
+    state = a.save({patch: {id: 'one', comment: 'Recoverable'}, selection: {add: ['two']}}, state);
+    assert.equal(state.ok, false);
+    assert.equal(state.reviews.one.comment, 'Recoverable');
+    assert.equal(values.get('review'), '{broken');
+    assert.deepEqual(JSON.parse(values.get('selection')), ['one', 'two']);
+    values.set('review', JSON.stringify({version: 1, reviews: {}, selected: []}));
+    values.set('selection', '{broken');
+    state = a.save({patch: {id: 'two', status: 'keep'}}, state);
+    assert.equal(state.ok, false);
+    assert.equal(JSON.parse(values.get('review')).reviews.one.comment, 'Recoverable');
+    assert.equal(JSON.parse(values.get('review')).reviews.two.status, 'keep');
+    assert.equal(values.get('selection'), '{broken');
+  });
+}
+
+test('hosted shared draft stays authoritative with an independent selection key', async t => {
+  const h = await boot(t, 'hosted', {shared: true, initialSelection: [asset.id],
+    sharedSession: Promise.resolve({userId: 'reviewer', mine: {ids: [libraryAsset.id], nickname: 'Mine', revision: 1}})});
+  await h.ready();
+  assert.deepEqual([...h.app.selected], [libraryAsset.id]);
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.buttons[1].onclick();
+  assert.deepEqual([...h.app.selected], [libraryAsset.id]);
+  h.get('#detail-selected').onchange({target: {checked: true}});
+  assert.deepEqual(new Set(h.app.selected), new Set([libraryAsset.id, asset.id]));
+});
+
+for (const mode of Object.keys(reviewer)) {
+  test(`${mode} clear and import apply to latest state; failed reviews do not replay successful selections`, async () => {
+    const {createReviewWriter, loadReviewState} = await import(new URL('shared/selection-state.mjs', reviewer[mode]));
+    for (const split of [false, true]) {
+      const config = {reviewKey: 'review', sharedSelections: false, ...(split ? {selectionStorageKey: 'selection'} : {})};
+      const values = new Map([['review', JSON.stringify({version: 1, reviews: {one: oldReview}, selected: ['one']})], ['selection', '["one"]']]);
+      let failedKey;
+      const storage = {getItem: key => values.get(key), setItem: (key, value) => {
+        if (key === failedKey) throw Error('quota');
+        values.set(key, value);
+      }};
+      const a = createReviewWriter(storage, config), b = createReviewWriter(storage, config);
+      let stale = loadReviewState(storage, config);
+      b.save({patch: {id: 'two', comment: 'other'}, selection: {add: ['two']}}, stale);
+      stale = a.save({reviews: {one: incomingReview}, selection: {add: ['three']}}, stale);
+      assert.equal(loadReviewState(storage, config).reviews.two.comment, 'other');
+      assert.deepEqual(new Set(loadReviewState(storage, config).selected), new Set(['one', 'two', 'three']));
+      stale = a.save({selection: {remove: ['one']}}, stale);
+      assert.deepEqual(loadReviewState(storage, config).selected, ['two', 'three']);
+      b.save({selection: {add: ['four']}}, stale);
+      stale = a.save({selection: {clear: true}}, stale);
+      assert.deepEqual(loadReviewState(storage, config).selected, []);
+      assert.equal(loadReviewState(storage, config).reviews.two.comment, 'other');
+      if (!split) continue;
+      failedKey = 'review';
+      stale = a.save({reviews: {one: incomingReview}, selection: {add: ['one']}}, stale);
+      failedKey = undefined;
+      b.save({selection: {remove: ['one']}}, loadReviewState(storage, config));
+      stale = a.save({patch: {id: 'two', status: 'keep'}}, stale);
+      assert.equal(stale.ok, true);
+      assert.deepEqual(loadReviewState(storage, config).selected, []);
+    }
+  });
+}
+
+test('hosted intent saves retain legacy Entity adapter reviews while upgrading stable identity', async () => {
+  const {createReviewWriter, loadReviewState} = await import('../reference/hosted/review-frontend/shared/selection-state.mjs');
+  const config = {reviewKey: 'review', dataKind: 'entity', projectId: 'entity', datasetId: 'verified', sharedSelections: true};
+  let bytes = JSON.stringify({version: 1, projectId: 'entity', datasetId: 'adapter', reviews: {one: oldReview}, selected: ['legacy']});
+  const storage = {getItem: () => bytes, setItem: (key, value) => {bytes = value;}};
+  const writer = createReviewWriter(storage, config);
+  const state = writer.save({patch: {id: 'two', comment: 'new'}}, loadReviewState(storage, config));
+  assert.equal(state.ok, true);
+  assert.equal(JSON.parse(bytes).datasetId, 'verified');
+  assert.deepEqual(JSON.parse(bytes).reviews.one, oldReview);
+  assert.deepEqual(JSON.parse(bytes).selected, ['legacy']);
+  bytes = JSON.stringify({version: 1, projectId: 'other', datasetId: 'adapter', reviews: {}});
+  const wrongIdentity = bytes;
+  assert.equal(writer.save({patch: {id: 'two', comment: 'memory'}}, state).ok, false);
+  assert.equal(bytes, wrongIdentity);
+});
+
+test('hosted shared account tabs rebase checkbox, remove, import and clear intents through real controllers', async t => {
+  const storageValues = new Map();
+  const options = {shared: true, storageValues, catalogObjects: [asset, {...libraryAsset, name: 'Second object'}]};
+  const a = await boot(t, 'hosted', options);
+  await a.ready();
+  const b = await boot(t, 'hosted', options);
+  await b.ready();
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const ids = () => JSON.parse(storageValues.get(key)).ids;
+  const select = async (tab, id, checked) => {
+    tab.activate();
+    await tab.app.openDetail(tab.app.itemMap.get(id));
+    tab.get('#detail-selected').onchange({target: {checked}});
+  };
+  await select(a, asset.id, true);
+  await select(b, libraryAsset.id, true);
+  assert.deepEqual(new Set(ids()), new Set([asset.id, libraryAsset.id]));
+  assert.deepEqual(new Set(b.app.selected), new Set(ids()));
+  assert.equal(b.get('#detail-selected').checked, true);
+  const c = await boot(t, 'hosted', options);
+  await c.ready();
+  assert.deepEqual(new Set(c.app.selected), new Set([asset.id, libraryAsset.id]));
+
+  await select(a, asset.id, false);
+  assert.deepEqual(ids(), [libraryAsset.id]);
+  b.activate();
+  await b.choose(async () => b.backup({selected: [asset.id], reviews: {}}));
+  assert.deepEqual(new Set(ids()), new Set([asset.id, libraryAsset.id]));
+  a.activate();
+  assert.equal(a.get('#selection-bar').hidden, false);
+  a.get('#clear-selection').onclick();
+  assert.deepEqual(ids(), []);
+
+  b.activate();
+  const nickname = b.get('main > header').following.querySelector('#partner-nickname');
+  nickname.value = 'Fresh name';
+  nickname.oninput();
+  assert.deepEqual(ids(), [], 'nickname must not resurrect stale selections');
+  assert.equal(JSON.parse(storageValues.get(key)).nickname, 'Fresh name');
+  a.activate();
+  const bytes = storageValues.get(key);
+  a.buttons[1].onclick();
+  assert.equal(storageValues.get(key), bytes, 'review-only edit must not touch account draft');
+  await select(a, asset.id, true);
+  assert.equal(JSON.parse(storageValues.get(key)).nickname, 'Fresh name');
+});
+
+test('hosted account draft failures retain explicit intents without replaying acknowledged changes', async t => {
+  const h = await boot(t, 'hosted', {shared: true});
+  await h.ready();
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const panel = h.get('main > header').following;
+  const warning = panel.querySelector('#partner-status').following;
+  h.values.set(key, '{broken');
+  await h.choose();
+  assert.match(h.toast(), /未能完整保存/);
+  assert.equal(h.values.get(key), '{broken');
+  assert.equal(warning.hidden, false);
+  assert(h.app.selected.has(asset.id));
+  h.values.set(key, JSON.stringify({ids: [libraryAsset.id], nickname: 'Other tab', baseRevision: 4}));
+  await h.choose();
+  assert.match(h.toast(), /已合并.*保存到当前浏览器/);
+  assert.deepEqual(new Set(JSON.parse(h.values.get(key)).ids), new Set([asset.id, libraryAsset.id]));
+  assert.equal(JSON.parse(h.values.get(key)).baseRevision, 4);
+  assert.equal(warning.hidden, true);
+
+  // Once the account key succeeds, later review-key recovery must not replay it.
+  h.setStorageError(h.config.reviewKey);
+  await h.choose();
+  h.values.set(key, JSON.stringify({ids: [], nickname: 'Other tab', baseRevision: 4}));
+  h.setStorageError(undefined);
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.buttons[1].onclick();
+  assert.deepEqual(JSON.parse(h.values.get(key)).ids, []);
+});
+
+test('hosted failed explicit server load keeps its replacement intent for the next draft save', async t => {
+  const mine = {userId: 'reviewer', ids: [libraryAsset.id], nickname: 'Server name', revision: 7};
+  const h = await boot(t, 'hosted', {shared: true, responses: {'/api/selections': () => ({lists: [mine]})}});
+  await h.ready();
+  await new Promise(resolve => setImmediate(resolve));
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  h.values.set(key, JSON.stringify({ids: [asset.id], nickname: 'Old persisted', baseRevision: 1}));
+  h.setStorageError(key);
+  const panel = h.get('main > header').following;
+  await panel.querySelector('#partner-load').onclick();
+  assert.deepEqual([...h.app.selected], [libraryAsset.id]);
+  assert.equal(panel.querySelector('#partner-status').following.hidden, false);
+  h.setStorageError(undefined);
+  const nickname = panel.querySelector('#partner-nickname');
+  nickname.value = 'After load';
+  nickname.oninput();
+  const saved = JSON.parse(h.values.get(key));
+  assert.deepEqual(saved.ids, [libraryAsset.id]);
+  assert.equal(saved.nickname, 'After load');
+  assert.equal(saved.baseRevision, 7);
+});
+
+for (const timing of ['before publish', 'during PUT']) {
+  test(`hosted publish acknowledgement preserves another tab draft edited ${timing}`, async t => {
+    const storageValues = new Map(), put = deferred();
+    let mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Original', revision: 2};
+    const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine},
+      catalogObjects: [asset, {...libraryAsset, name: 'Other object'}], responses: {
+        '/api/selections': () => ({lists: [mine]}), '/api/selections/me': () => put.promise
+      }};
+    const a = await boot(t, 'hosted', options);
+    await a.ready();
+    const b = await boot(t, 'hosted', options);
+    await b.ready();
+    const control = (tab, id) => tab.get('main > header').following.querySelector('#partner-' + id);
+    const editB = async () => {
+      b.activate();
+      await b.app.openDetail(b.app.itemMap.get(libraryAsset.id));
+      b.get('#detail-selected').onchange({target: {checked: true}});
+      control(b, 'nickname').value = 'Other tab name';
+      control(b, 'nickname').oninput();
+    };
+    if (timing === 'before publish') await editB();
+    a.activate();
+    const publishing = control(a, 'publish').onclick();
+    const request = a.requests.find(([path]) => path === '/api/selections/me');
+    assert.deepEqual(JSON.parse(request[2]), {nickname: 'Original', ids: [asset.id], revision: 2});
+    if (timing === 'during PUT') await editB();
+    a.activate();
+    mine = {...mine, revision: 3};
+    put.resolve({mine});
+    await publishing;
+    const saved = JSON.parse(storageValues.get('asset-review-selection-v1:fixture:reviewer'));
+    assert.deepEqual(new Set(saved.ids), new Set([asset.id, libraryAsset.id]));
+    assert.equal(saved.nickname, 'Other tab name');
+    assert.equal(saved.baseRevision, 3);
+    assert.deepEqual(new Set(a.app.selected), new Set(saved.ids));
+    assert.equal(control(a, 'nickname').value, 'Other tab name');
+    assert.match(control(a, 'status').textContent, /其他草稿改动仍未发布/);
+    a.acceptConfirmation(false);
+    await control(a, 'load').onclick();
+    assert.equal(a.confirmations.length, 1);
+    assert.deepEqual(new Set(a.app.selected), new Set(saved.ids));
+    assert.equal(a.requests.filter(([path]) => path === '/api/selections/me').length, 1);
+    const c = await boot(t, 'hosted', options);
+    await c.ready();
+    assert.deepEqual(new Set(c.app.selected), new Set(saved.ids));
+  });
+}
+
+test('hosted publish acknowledgement merges its unsaved edits with another tab draft', async t => {
+  const storageValues = new Map(), put = deferred();
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Original', revision: 2};
+  const third = {id: 'third', name: 'Third object'};
+  const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine},
+    catalogObjects: [asset, {...libraryAsset, name: 'Other object'}, third],
+    responses: {'/api/selections/me': () => put.promise}};
+  const a = await boot(t, 'hosted', options);
+  await a.ready();
+  const b = await boot(t, 'hosted', options);
+  await b.ready();
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  a.activate();
+  const control = id => a.get('main > header').following.querySelector('#partner-' + id);
+  const publishing = control('publish').onclick();
+  a.setStorageError(key);
+  await a.app.openDetail(a.app.itemMap.get(third.id));
+  a.get('#detail-selected').onchange({target: {checked: true}});
+  control('nickname').value = 'Unsaved own name';
+  control('nickname').oninput();
+  b.activate();
+  await b.app.openDetail(b.app.itemMap.get(libraryAsset.id));
+  b.get('#detail-selected').onchange({target: {checked: true}});
+  a.activate();
+  a.setStorageError(undefined);
+  put.resolve({mine: {...mine, revision: 3}});
+  await publishing;
+  const saved = JSON.parse(storageValues.get(key));
+  assert.deepEqual(new Set(saved.ids), new Set([asset.id, libraryAsset.id, third.id]));
+  assert.equal(saved.nickname, 'Unsaved own name');
+  assert.equal(saved.baseRevision, 3);
+  assert.deepEqual(JSON.parse(a.requests.find(([path]) => path === '/api/selections/me')[2]),
+    {nickname: 'Original', ids: [asset.id], revision: 2});
+});
+
+for (const stored of [undefined, '{broken']) {
+  test(`hosted publish acknowledgement handles ${stored === undefined ? 'missing' : 'corrupt'} account draft truthfully`, async t => {
+    const put = deferred(), mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Original', revision: 2};
+    const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine},
+      responses: {'/api/selections/me': () => put.promise}});
+    await h.ready();
+    const key = 'asset-review-selection-v1:fixture:reviewer';
+    const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+    const publishing = control('publish').onclick();
+    if (stored !== undefined) h.values.set(key, stored);
+    put.resolve({mine: {...mine, revision: 3}});
+    await publishing;
+    if (stored === undefined) {
+      assert.equal(JSON.parse(h.values.get(key)).baseRevision, 3);
+      assert.deepEqual(JSON.parse(h.values.get(key)).ids, [asset.id]);
+      assert.equal(control('status').following.hidden, true);
+    } else {
+      assert.equal(h.values.get(key), stored);
+      assert.match(control('status').textContent, /已发布提交时的 1 项.*草稿未能同步确认/);
+      assert.equal(control('status').following.hidden, false);
+      h.values.set(key, JSON.stringify({ids: [libraryAsset.id], nickname: 'Recovered draft', baseRevision: 2}));
+      control('nickname').value = 'Retry name';
+      control('nickname').oninput();
+      assert.deepEqual(JSON.parse(h.values.get(key)).ids, [libraryAsset.id]);
+      assert.equal(JSON.parse(h.values.get(key)).baseRevision, 3);
+    }
+  });
+}
+
+test('hosted stale clean tab confirms before replacing another tab unpublished draft', async t => {
+  const storageValues = new Map();
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server name', revision: 2};
+  const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine},
+    catalogObjects: [asset, {...libraryAsset, name: 'Other object'}],
+    responses: {'/api/selections': () => ({lists: [mine]})}};
+  const a = await boot(t, 'hosted', options);
+  await a.ready();
+  const b = await boot(t, 'hosted', options);
+  await b.ready();
+  await b.app.openDetail(b.app.itemMap.get(libraryAsset.id));
+  b.get('#detail-selected').onchange({target: {checked: true}});
+  const control = (tab, id) => tab.get('main > header').following.querySelector('#partner-' + id);
+  control(b, 'nickname').value = 'Unpublished B';
+  control(b, 'nickname').oninput();
+  const key = 'asset-review-selection-v1:fixture:reviewer', original = storageValues.get(key);
+  a.activate();
+  a.acceptConfirmation(false);
+  await control(a, 'load').onclick();
+  assert.equal(a.confirmations.length, 1);
+  assert.equal(storageValues.get(key), original);
+  assert.deepEqual([...a.app.selected], [asset.id]);
+  assert.equal(control(a, 'nickname').value, 'Server name');
+  a.acceptConfirmation(true);
+  await control(a, 'load').onclick();
+  assert.equal(a.confirmations.length, 2);
+  assert.deepEqual(JSON.parse(storageValues.get(key)).ids, [asset.id]);
+  assert.equal(JSON.parse(storageValues.get(key)).nickname, 'Server name');
+});
+
+test('hosted explicit load warns on unreadable draft and decline preserves bytes and UI', async t => {
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine},
+    responses: {'/api/selections': () => ({lists: [mine]})}});
+  await h.ready();
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  h.values.set(key, '{broken');
+  const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+  h.acceptConfirmation(false);
+  await control('load').onclick();
+  assert.match(h.confirmations[0], /无法读取当前浏览器草稿/);
+  assert.equal(h.values.get(key), '{broken');
+  assert.deepEqual([...h.app.selected], [asset.id]);
+  assert.equal(control('nickname').value, 'Server');
+  assert.equal(control('status').following.hidden, false);
+  h.acceptConfirmation(true);
+  await control('load').onclick();
+  assert.deepEqual(JSON.parse(h.values.get(key)).ids, [asset.id]);
+  assert.equal(control('status').following.hidden, true);
+});
+
+test('hosted retry of failed revision acknowledgement cannot downgrade another tab newer publication', async t => {
+  const storageValues = new Map(), key = 'asset-review-selection-v1:fixture:reviewer';
+  let mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  storageValues.set(key, JSON.stringify({ids: mine.ids, nickname: mine.nickname, baseRevision: 2}));
+  const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine}, responses: {
+    '/api/selections': () => ({lists: [mine]}),
+    '/api/selections/me': body => {
+      const submitted = JSON.parse(body);
+      assert.equal(submitted.revision, mine.revision);
+      mine = {...mine, ids: submitted.ids, nickname: submitted.nickname, revision: mine.revision + 1};
+      return {mine};
+    }
+  }};
+  const a = await boot(t, 'hosted', options);
+  await a.ready();
+  const b = await boot(t, 'hosted', options);
+  await b.ready();
+  const control = (tab, id) => tab.get('main > header').following.querySelector('#partner-' + id);
+  a.activate();
+  a.setStorageError(key);
+  await control(a, 'publish').onclick();
+  assert.equal(mine.revision, 3);
+  assert.equal(JSON.parse(storageValues.get(key)).baseRevision, 2);
+  b.activate();
+  await control(b, 'load').onclick();
+  await control(b, 'publish').onclick();
+  assert.equal(JSON.parse(storageValues.get(key)).baseRevision, 4);
+  a.activate();
+  a.setStorageError(undefined);
+  control(a, 'nickname').value = 'Retry after B';
+  control(a, 'nickname').oninput();
+  assert.equal(JSON.parse(storageValues.get(key)).baseRevision, 4);
+  await control(a, 'publish').onclick();
+  const submissions = a.requests.filter(([path]) => path === '/api/selections/me');
+  assert.equal(JSON.parse(submissions.at(-1)[2]).revision, 4);
+});
+
+test('hosted draft with no server version retains revision zero', async t => {
+  const h = await boot(t, 'hosted', {shared: true});
+  await h.ready();
+  const panel = h.get('main > header').following;
+  panel.querySelector('#partner-nickname').value = 'First draft';
+  panel.querySelector('#partner-nickname').oninput();
+  assert.equal(JSON.parse(h.values.get('asset-review-selection-v1:fixture:reviewer')).baseRevision, 0);
+});
+
+test('hosted ordinary shared card toggles retain grid nodes but remote changes reconcile them', async t => {
+  const h = await boot(t, 'hosted', {shared: true, catalogObjects: [asset, {...libraryAsset, name: 'Other object'}]});
+  await h.ready();
+  const checkbox = h.cardCheckbox();
+  for (const checked of [true, false, true]) {
+    checkbox.checked = checked;
+    checkbox.onchange({target: checkbox});
+    assert.strictEqual(h.cardCheckbox(), checkbox, 'ordinary toggle must retain the focused checkbox and grid');
+    assert.equal(h.app.selected.has(asset.id), checked);
+  }
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const latest = JSON.parse(h.values.get(key));
+  latest.ids.push(libraryAsset.id);
+  h.values.set(key, JSON.stringify(latest));
+  checkbox.checked = false;
+  checkbox.onchange({target: checkbox});
+  assert.notStrictEqual(h.cardCheckbox(), checkbox, 'a changed remote selection still reconciles the rendered grid');
+  assert.deepEqual([...h.app.selected], [libraryAsset.id]);
+});
+
+for (const mode of Object.keys(reviewer)) {
+  for (const split of [false, true]) {
+    test(`${mode} ${split ? 'split' : 'single'} key tabs reconcile visible selections in place and export them`, async t => {
+      const storageValues = new Map();
+      const options = {storageValues, catalogObjects: [asset, {...libraryAsset, name: 'Other object'}],
+        ...(split ? {initialSelection: []} : {})};
+      const a = await boot(t, mode, options);
+      await a.ready();
+      const b = await boot(t, mode, options);
+      await b.ready();
+      a.activate();
+      const remote = a.card(libraryAsset.id).querySelector('.card-check');
+      remote.checked = true;
+      remote.onchange({target: remote});
+      b.activate();
+      const localCard = b.card(asset.id), remoteCard = b.card(libraryAsset.id);
+      const local = localCard.querySelector('.card-check');
+      local.checked = true;
+      local.onchange({target: local});
+      assert.strictEqual(b.card(asset.id), localCard);
+      assert.strictEqual(b.card(libraryAsset.id), remoteCard);
+      assert.equal(remoteCard.querySelector('.card-check').checked, true);
+      assert(remoteCard.classes.has('selected'));
+      assert.deepEqual(new Set(b.app.selected), new Set([asset.id, libraryAsset.id]));
+      b.get('#export-json').onclick();
+      const exported = JSON.parse(await b.downloads[0].blob.text());
+      assert.deepEqual(new Set(exported.selected), new Set([asset.id, libraryAsset.id]));
+
+      b.app.changeView('selected');
+      a.activate();
+      remote.checked = false;
+      remote.onchange({target: remote});
+      b.activate();
+      await b.app.openDetail(b.app.itemMap.get(asset.id));
+      b.buttons[1].onclick();
+      assert.deepEqual(b.visibleIds(), [asset.id], 'selected view removes remotely deselected row after own save');
+      assert.equal(b.get('#detail-selected').checked, true);
+      b.app.changeView('reviewed');
+      assert.deepEqual(b.visibleIds(), [asset.id]);
+      a.activate();
+      await a.app.openDetail(a.app.itemMap.get(libraryAsset.id));
+      a.buttons[0].onclick();
+      b.activate();
+      b.buttons[1].onclick();
+      assert.deepEqual(new Set(b.visibleIds()), new Set([asset.id, libraryAsset.id]), 'reviewed view includes remotely reviewed row after own save');
+    });
+  }
+}
+
+test('hosted clean publish trims nickname without creating false load confirmation', async t => {
+  let mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Old', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine}, responses: {
+    '/api/selections': () => ({lists: [mine]}),
+    '/api/selections/me': body => {mine = {...mine, ...JSON.parse(body), revision: 3}; return {mine};}
+  }});
+  await h.ready();
+  const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+  control('nickname').value = ' New ';
+  control('nickname').oninput();
+  await control('publish').onclick();
+  assert.equal(control('nickname').value, 'New');
+  assert.equal(JSON.parse(h.values.get('asset-review-selection-v1:fixture:reviewer')).nickname, 'New');
+  assert.doesNotMatch(control('status').textContent, /仍未发布/);
+  await control('load').onclick();
+  assert.equal(h.confirmations.length, 0);
 });

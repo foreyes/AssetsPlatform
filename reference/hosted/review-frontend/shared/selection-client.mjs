@@ -3,6 +3,7 @@ import {browserStorage} from './selection-state.mjs';
 /** One shared UI module for both asset review sites; local drafts are never called shared. */
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const same=(a,b)=>JSON.stringify([...a].sort())===JSON.stringify([...b].sort());
+const normalizeNickname = value => String(value ?? '').trim();
 export async function mountPartnerSelections({enabled=true,siteId,legacyKey,items,getSelected,replaceSelected,openItem,getProfile}) {
  if(!enabled)return {changed(){},decorateDownloads(){}};
  const root=document.createElement('section');root.className='partner-selections';root.setAttribute('aria-label','身份与伙伴选择');
@@ -24,14 +25,59 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
   try{return JSON.parse(browserStorage.getItem(key)||'null')}
   catch{storageWarning.hidden=false;return null}
  };
+ const newestRevision = (...values) => Math.max(0, ...values.filter(value => Number.isSafeInteger(value) && value >= 0));
+ const readAccountDraft = () => {
+  const latest = JSON.parse(browserStorage.getItem(key) || 'null');
+  if (latest !== null && (!latest || typeof latest !== 'object' || Array.isArray(latest) || !Array.isArray(latest.ids))) throw Error('Invalid account draft');
+  return latest;
+ };
+ let pendingSelection = [], pendingNickname, pendingBaseRevision;
  const saveDraft=()=>{
   if(!identity)return false;
   try{
    browserStorage.setItem(key,JSON.stringify({ids:[...getSelected()],nickname:$('partner-nickname').value,baseRevision:knownServerRevision,updatedAt:new Date().toISOString()}));
+   pendingSelection = [];
+   pendingNickname = undefined;
+   pendingBaseRevision = undefined;
    storageWarning.hidden=true;
    return true;
   }catch{
+   pendingSelection = [{clear: true, add: [...getSelected()]}];
+   pendingNickname = $('partner-nickname').value;
+   pendingBaseRevision = knownServerRevision;
    storageWarning.hidden=false;
+   return false;
+  }
+ };
+ // Ordinary edits rebase only their explicit intent; explicit server loads retain
+ // the intentional whole-draft save above. Failed intents remain exportable in memory.
+ const saveSelection = (intent, acknowledgedNickname) => {
+  if (intent) pendingSelection.push(intent);
+  if (!identity) return false;
+  try {
+   const latest = readAccountDraft();
+   const ids = new Set(latest ? valid(latest.ids) : getSelected());
+   for (const change of pendingSelection) {
+    if (change.clear) ids.clear();
+    for (const id of valid(change.add)) ids.add(id);
+    for (const id of valid(change.remove)) ids.delete(id);
+   }
+   let nickname = pendingNickname ?? latest?.nickname ?? $('partner-nickname').value;
+   if (acknowledgedNickname !== undefined && normalizeNickname(nickname) === acknowledgedNickname) nickname = acknowledgedNickname;
+   const baseRevision = newestRevision(pendingBaseRevision, latest?.baseRevision, knownServerRevision);
+   browserStorage.setItem(key, JSON.stringify({ids: [...ids], nickname, baseRevision, updatedAt: new Date().toISOString()}));
+   pendingSelection = [];
+   pendingNickname = undefined;
+   pendingBaseRevision = undefined;
+   const selectionChanged = !same(getSelected(), ids);
+   dirty ||= selectionChanged || normalizeNickname($('partner-nickname').value) !== normalizeNickname(nickname);
+   knownServerRevision = baseRevision;
+   $('partner-nickname').value = nickname;
+   if (selectionChanged) replaceSelected([...ids]);
+   storageWarning.hidden = true;
+   return true;
+  } catch {
+   storageWarning.hidden = false;
    return false;
   }
  };
@@ -45,7 +91,7 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
   const resolved=await resolveSelectionAssets(data,ids,fetchDeliveryShard);
   download(filename,{schema:'asset-review-selection-manifest/1',siteId,siteUrl:location.origin,generatedAt:new Date().toISOString(),selection:{...selection,ids},assets:resolved.map(a=>({...a,selected:ids.includes(a.id),files:a.files.map(f=>({...f,url:new URL(f.path,location.origin).href}))})),rendererProfile:getProfile(),rendererProfiles:data.rendererProfiles,delivery:data.delivery,access:{authenticationRequired:true,instruction:'Use your own authorized login; this manifest carries no credentials. Drive access is governed by your own existing permission, not link visibility.'},warnings:[...warnings,'GLB browser previews are not import-ready Unity packages.','Dependency references are not proof of full Unity dependency closure.','Browser shader modes are approximations, not original game shaders.']});
  };
- const renderLists=lists=>{$('partner-total').textContent=`(${lists.length})`;$('partner-lists').replaceChildren();for(const list of lists){const box=document.createElement('article');box.className='partner-list';box.innerHTML=`<div><strong>${esc(list.nickname)}的选择${list.userId===identity.userId?'（我）':''}</strong> · ${list.ids.length} 项</div><small>站内 ID：${esc(list.userId)} · 版本 ${list.revision} · ${esc(list.updatedAt)}</small><div class="partner-list-actions"><button class="light-btn" data-manifest>导出此清单 manifest</button><button class="light-btn" data-copy>将这些项加入我的草稿</button></div><details><summary>查看资产</summary><div class="partner-items"></div></details>`;box.querySelector('[data-manifest]').onclick=safeRun(async()=>{const plan=await api('/api/selections/manifest?user='+encodeURIComponent(list.userId));await exportSelection({...plan.selection,scope:'server-shared-selection'},`selection-${siteId}-${plan.selection.revision}.json`);status('已导出服务器共享清单的完整资源 manifest，不含登录凭据。')});box.querySelector('[data-copy]').onclick=()=>{replaceSelected(valid([...getSelected(),...list.ids]));changed();status('已加入你的本地草稿。未修改对方清单，也未自动发布。')};const entries=box.querySelector('.partner-items');for(const id of list.ids){const item=map.get(id),button=document.createElement('button');button.className='text-btn';button.textContent=item?.name||id;button.disabled=!item;button.onclick=()=>openItem(item);entries.append(button)}$('partner-lists').append(box)}if(!lists.length)$('partner-lists').textContent='还没有人发布选择。'};
+ const renderLists=lists=>{$('partner-total').textContent=`(${lists.length})`;$('partner-lists').replaceChildren();for(const list of lists){const box=document.createElement('article');box.className='partner-list';box.innerHTML=`<div><strong>${esc(list.nickname)}的选择${list.userId===identity.userId?'（我）':''}</strong> · ${list.ids.length} 项</div><small>站内 ID：${esc(list.userId)} · 版本 ${list.revision} · ${esc(list.updatedAt)}</small><div class="partner-list-actions"><button class="light-btn" data-manifest>导出此清单 manifest</button><button class="light-btn" data-copy>将这些项加入我的草稿</button></div><details><summary>查看资产</summary><div class="partner-items"></div></details>`;box.querySelector('[data-manifest]').onclick=safeRun(async()=>{const plan=await api('/api/selections/manifest?user='+encodeURIComponent(list.userId));await exportSelection({...plan.selection,scope:'server-shared-selection'},`selection-${siteId}-${plan.selection.revision}.json`);status('已导出服务器共享清单的完整资源 manifest，不含登录凭据。')});box.querySelector('[data-copy]').onclick=()=>{replaceSelected(valid([...getSelected(),...list.ids]));changed({add: valid(list.ids)});status('已加入你的本地草稿。未修改对方清单，也未自动发布。')};const entries=box.querySelector('.partner-items');for(const id of list.ids){const item=map.get(id),button=document.createElement('button');button.className='text-btn';button.textContent=item?.name||id;button.disabled=!item;button.onclick=()=>openItem(item);entries.append(button)}$('partner-lists').append(box)}if(!lists.length)$('partner-lists').textContent='还没有人发布选择。'};
  const refresh=async()=>{
   const generation=++refreshGeneration;
   try{
@@ -63,10 +109,10 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
  });
  const hasNewServerRevision=()=>mine&&mine.revision!==knownServerRevision;
  const newServerRevisionMessage='服务器清单已更新。本地草稿保留；点击“载入服务器版本”会替换当前草稿。';
- const changed=()=>{
+ const changed=intent=>{
   if(!identity)return false;
   dirty=true;
-  const isSaved=saveDraft();
+  const isSaved=saveSelection(intent);
   status(`本浏览器草稿 ${getSelected().size} 项，尚未发布给伙伴。`);
   return isSaved;
  };
@@ -74,21 +120,48 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
   if(!identity||!await refresh())return;
   status(hasNewServerRevision()?newServerRevisionMessage:'共享清单已刷新。本地勾选仍是你的草稿。');
  });
- $('partner-nickname').oninput=changed;
+ $('partner-nickname').oninput=()=>{pendingNickname=$('partner-nickname').value;changed();};
  $('partner-publish').onclick=safeRun(async()=>{
   const nicknameInput=$('partner-nickname'),draftNickname=nicknameInput.value;
-  const snapshot={nickname:draftNickname.trim(),ids:[...getSelected()],revision:knownServerRevision};
+  const snapshot={nickname:normalizeNickname(draftNickname),ids:[...getSelected()],revision:knownServerRevision};
   if(!snapshot.nickname)throw Error('请先设置昵称');
   const result=await api('/api/selections/me',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(snapshot)});
   mine=result.mine;
-  knownServerRevision=mine.revision;
-  dirty=!same(getSelected(),snapshot.ids)||nicknameInput.value!==draftNickname;
-  if(!dirty)nicknameInput.value=snapshot.nickname;
-  saveDraft();
-  status(dirty?`已发布提交时的 ${mine.ids.length} 项。之后的草稿改动仍未发布。`:`已发布 ${mine.ids.length} 项，现有站点伙伴可查看。昵称不改变真实站内 ID。`);
+  pendingBaseRevision = newestRevision(pendingBaseRevision, knownServerRevision, mine.revision);
+  knownServerRevision = pendingBaseRevision;
+  // Acknowledgement advances the revision of the latest local draft; it must
+  // not publish or overwrite edits another tab made before/during this request.
+  const isDraftSaved = saveSelection(undefined, snapshot.nickname);
+  dirty = !isDraftSaved || !same(getSelected(), snapshot.ids) || normalizeNickname(nicknameInput.value) !== normalizeNickname(draftNickname);
+  status(!isDraftSaved
+   ? `已发布提交时的 ${mine.ids.length} 项，但浏览器草稿未能同步确认；请保留当前页面并导出备份。`
+   : dirty ? `已发布提交时的 ${mine.ids.length} 项。其他草稿改动仍未发布。`
+   : `已发布 ${mine.ids.length} 项，现有站点伙伴可查看。昵称不改变真实站内 ID。`);
   refreshInBackground();
  });
- $('partner-load').onclick=safeRun(async()=>{await refresh();if(dirty&&!confirm('这会用服务器版本替换当前浏览器草稿。继续吗？'))return;replaceSelected(valid(mine?.ids||[]));$('partner-nickname').value=mine?.nickname||'';knownServerRevision=mine?.revision||0;dirty=false;saveDraft();status('已载入本人服务器版本。其他人的清单未改变。')});
+ $('partner-load').onclick=safeRun(async()=>{
+  await refresh();
+  const serverIds = valid(mine?.ids || []), serverNickname = mine?.nickname || '';
+  let needsConfirmation = dirty, unreadable = false;
+  try {
+   const latest = readAccountDraft();
+   needsConfirmation ||= latest !== null && (!same(valid(latest.ids), serverIds) || normalizeNickname(latest.nickname) !== normalizeNickname(serverNickname));
+  } catch {
+   unreadable = true;
+   needsConfirmation = true;
+   storageWarning.hidden = false;
+  }
+  const message = unreadable
+   ? '无法读取当前浏览器草稿。这会用服务器版本替换它，原内容可能无法恢复。继续吗？'
+   : '这会用服务器版本替换当前浏览器草稿。继续吗？';
+  if (needsConfirmation && !confirm(message)) return;
+  replaceSelected(serverIds);
+  $('partner-nickname').value = serverNickname;
+  knownServerRevision = mine?.revision || 0;
+  dirty = false;
+  saveDraft();
+  status('已载入本人服务器版本。其他人的清单未改变。');
+ });
  $('partner-export').onclick=safeRun(async()=>{await exportSelection({userId:identity.userId,nickname:$('partner-nickname').value,ids:[...getSelected()],scope:'local-draft-not-shared',baseRevision:knownServerRevision},`selection-${siteId}-local-draft.json`,['Local draft is not visible to partners until published.']);status('已导出本地草稿 manifest；不会因此发布给伙伴。')});
  try{
   const session=await api('/api/selection/session');
@@ -101,7 +174,7 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
   const draftNickname=saved?.nickname??serverNickname;
   if(saved){
    if(Number.isSafeInteger(saved.baseRevision))knownServerRevision=saved.baseRevision;
-   dirty=!same(getSelected(),mine?.ids||[])||draftNickname!==serverNickname;
+   dirty=!same(getSelected(),mine?.ids||[])||normalizeNickname(draftNickname)!==normalizeNickname(serverNickname);
   }
   $('partner-nickname').value=draftNickname;
   const legacy=valid(readDraft(legacyKey)?.selected);
@@ -109,7 +182,7 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
    $('partner-legacy').hidden=false;
    $('partner-legacy').onclick=()=>{
     replaceSelected(valid([...getSelected(),...legacy]));
-    changed();
+    changed({add: legacy});
     $('partner-legacy').hidden=true;
     status('旧选择已加入当前身份的草稿，未自动发布。');
    };
@@ -136,7 +209,7 @@ export async function mountPartnerSelections({enabled=true,siteId,legacyKey,item
    container.querySelector('.partner-downloads')?.remove();container.append(box);
   }catch{/* Existing original download links stay intact. */}
  }
- return {changed,decorateDownloads,saveDraft};
+ return {changed,decorateDownloads,saveDraft,saveSelection};
 }
 
 /** Download presentation only; identity, local drafts and server writes are unchanged. */
