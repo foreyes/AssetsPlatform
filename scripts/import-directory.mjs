@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const app = path.join(root, 'apps/reviewer');
 export const IMPORT_LIMITS = Object.freeze({models:512, entries:10000, depth:32, totalBytes:256*1024*1024});
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+const overlapMessage = 'Output must be outside source and platform repository';
 function within(child, parent) {
   let current = child;
   while (current !== parent) {
@@ -17,6 +18,21 @@ function within(child, parent) {
     current = ancestor;
   }
   return true;
+}
+function rejectOverlap(source, output, repository) {
+  if (within(output, repository) || within(output, source) || within(source, output)) {
+    throw Error(overlapMessage);
+  }
+}
+function hasWindowsAncestor(child, parent, canonicalParent) {
+  const foldedParent = parent.toLowerCase();
+  let current = child;
+  while (current.toLowerCase() !== foldedParent) {
+    const ancestor = path.dirname(current);
+    if (ancestor === current) return false;
+    current = ancestor;
+  }
+  return fs.realpathSync.native(current) === canonicalParent;
 }
 function noLinks(target) {
   let current = path.parse(target).root;
@@ -43,12 +59,17 @@ export function importDirectory({source, output, id, label=id}) {
   const outputParent = path.dirname(output);
   noLinks(source); noLinks(outputParent);
   if (!fs.statSync(source).isDirectory()) throw Error('Source must be a directory');
-  // Canonical names match filesystem aliases without folding distinct case-sensitive siblings.
+  // A mounted volume can move realpath outside a lexically protected tree.
+  rejectOverlap(source, output, root);
+  // Canonical names catch aliases without folding distinct case-sensitive siblings.
   const canonicalSource = fs.realpathSync.native(source);
   const canonicalRoot = fs.realpathSync.native(root);
   const canonicalOutput = path.join(fs.realpathSync.native(outputParent), path.basename(output));
-  if (within(canonicalOutput, canonicalRoot) || within(canonicalOutput, canonicalSource) ||
-      within(canonicalSource, canonicalOutput)) throw Error('Output must be outside source and platform repository');
+  rejectOverlap(canonicalSource, canonicalOutput, canonicalRoot);
+  // Verify the identity of a case-aliased ancestor before a mount can hide it.
+  if (process.platform === 'win32' &&
+      (hasWindowsAncestor(outputParent, source, canonicalSource) ||
+       hasWindowsAncestor(outputParent, root, canonicalRoot))) throw Error(overlapMessage);
   if (fs.existsSync(output)) throw Error('Output already exists; nothing overwritten');
   const files=[]; let entries=0, totalBytes=0;
   function scan(dir, depth=0) {

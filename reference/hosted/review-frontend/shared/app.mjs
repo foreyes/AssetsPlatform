@@ -233,7 +233,7 @@ function persist(intent) {
   const known = new Set(itemMap.keys());
   reviews = sanitizeReviews(saved.reviews, projectData?.kind === 'entity' && !projectData.datasets.adapter ? new Set(Object.keys(saved.reviews)) : known);
   selected = new Set(saved.selected.filter(id => known.has(id)));
-  unavailableSelected = projectData?.kind === 'entity' && !projectData.datasets.adapter ? saved.selected.filter(id => !known.has(id)) : [];
+  unavailableSelected = config.sharedSelections || (projectData?.kind === 'entity' && !projectData.datasets.adapter) ? saved.selected.filter(id => !known.has(id)) : [];
   legacySelected = saved.legacySelected;
   storageOK = saved.ok;
   $('#storage-warning').hidden = storageOK;
@@ -284,6 +284,8 @@ function normalizeObject(record, basesById, basesBySourceId) {
     ...record
   };
   const rawName = record.name || base.name || record.id;
+  const explicitModelUrl = record.assemblyModelUrl || record.modelUrl || record.materialModelUrl;
+  const usesBaseModel = !explicitModelUrl || (base.modelAsset && base.modelUrl && new URL(explicitModelUrl, config.assetRoot).href === new URL(base.modelUrl, config.assetRoot).href);
   return {
     ...merged,
     id: String(record.id),
@@ -292,7 +294,9 @@ function normalizeObject(record, basesById, basesBySourceId) {
     type: 'object',
     isObject: true,
     category: objectCategory(merged),
-    modelUrl: record.assemblyModelUrl || record.modelUrl || record.materialModelUrl || base.modelUrl,
+    modelUrl: explicitModelUrl || base.modelUrl,
+    modelAsset: record.modelAsset || (usesBaseModel ? base.modelAsset : undefined),
+    variants: record.variants || (explicitModelUrl ? [] : base.variants),
     previewUrl: record.previewUrl || record.thumbnailUrl || base.previewUrl,
     notes: Array.isArray(record.notes) ? record.notes : Array.isArray(base.notes) ? base.notes : [],
     provenance: record.provenance || base.provenance || {},
@@ -504,10 +508,13 @@ async function init() {
       enabled: config.sharedSelections,
       siteId: config.siteId,
       legacyKey: KEY,
+      localSelectionStorageKey: config.selectionStorageKey,
+      exportLocalDraft: exportReviewBackup,
       items,
-      getSelected: () => selected,
+      getSelected: () => new Set([...selected, ...unavailableSelected]),
       replaceSelected: ids => {
-        selected = new Set(ids);
+        selected = new Set(ids.filter(id => itemMap.has(id)));
+        unavailableSelected = ids.filter(id => !itemMap.has(id));
         syncDetailSelection();
         renderNavigation();
         render();
@@ -1020,6 +1027,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
   const item = current;
   if (!item) return;
   const rendered = currentVariant || item;
+  $('#retry-preview').hidden = true;
   viewerLoading = true;
   $('#toggle-render-compare').disabled = true;
   const candidateRecord = item.isObject ? selectedAnimationRecord(item) : null;
@@ -1071,13 +1079,12 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     offerPreviewRetry();
   };
   const offerPreviewRetry = () => {
-    const retry = document.createElement('button');
-    retry.type = 'button';
-    retry.textContent = '重试实时预览';
+    const retry = $('#retry-preview');
+    retry.hidden = false;
     retry.onclick = () => {
       if (request === viewerRequest) startViewers();
     };
-    stageA.append(retry);
+
   };
   try {
     const modelUrl = animationRecord?.modelUrl || rendered.modelUrl;
@@ -1149,7 +1156,7 @@ async function openDetail(item) {
   previewQueue?.cancel();
   if (current) saveComment();
   current = item;
-  currentVariant = (item.variants || []).find(v => v.modelAsset === item.modelAsset) || (item.variants || [])[0] || null;
+  currentVariant = (item.variants || []).find(v => item.modelAsset ? v.modelAsset === item.modelAsset : v.modelUrl === item.modelUrl) || (item.variants || [])[0] || null;
   const variants = $('#resource-variant');
   variants.hidden = !(item.variants || []).length;
   variants.innerHTML = (item.variants || []).map(v => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join('');
@@ -1372,6 +1379,30 @@ function download(name, content, type) {
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+function exportReviewBackup() {
+  if (!isReviewImportReady) return false;
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const intent = current && commentDirty && $('#comment').value !== commentBaseline ? {patch: {id: current.id, comment: $('#comment').value}} : {};
+  const accountSnapshot = partnerSelections?.authenticated ? partnerSelections.snapshotSelection() : null;
+  const snapshot = reviewWriter.snapshot({reviews, selected: accountSnapshot?.selected ?? [...selected, ...unavailableSelected], legacySelected,
+    accountSelection: partnerSelections?.authenticated === true}, intent);
+  snapshot.ok &&= accountSnapshot?.ok ?? true;
+  const payload = {
+    ...reviewBackupIdentity(config), exportedAt: new Date().toISOString(), scope: 'full-catalogue',
+    selected: snapshot.selected, reviews: snapshot.reviews,
+    warnings: snapshot.ok ? [] : ['存储不可用、缺失或损坏，无法确认其他标签页的最新更改；已保留当前可读取与未保存的状态。'],
+    notice: '仅备份选择与审阅，不恢复账号或昵称，不是交付 manifest。目录中暂不可用的 ID 会保留在文件中，须待目录恢复后再导入。'
+  };
+  const blob = new Blob([JSON.stringify(payload)], {type: 'application/json'});
+  if (blob.size > config.importLimitMiB * 1024 * 1024) {
+    alert(`选择与审阅备份超过 ${config.importLimitMiB} MiB 导入上限，未导出可恢复备份。请保留当前页面，不要刷新或关闭。`);
+    showToast('备份超过导入上限，未导出；请保留当前页面');
+    return false;
+  }
+  download(`${config.exportPrefix}_ReviewBackup_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
+  showToast(snapshot.ok ? '选择与审阅备份已导出；暂不可用的 ID 须待目录恢复后再导入' : '已导出可读取与未保存的状态；无法确认其他标签页的最新更改');
+  return true;
+}
 function exportJSON(all = false) {
   const subset = all ? items : items.filter(a => selected.has(a.id));
   const payload = {
@@ -1499,7 +1530,7 @@ $$('[data-bg]').forEach(button => button.onclick = () => {
 });
 $('#clear-selection').onclick = () => {
   if (!isSelectionReady || (!selected.size && !unavailableSelected.length)) return;
-  const hadDraftSelection = selected.size > 0;
+  const hadDraftSelection = selected.size > 0 || unavailableSelected.length > 0;
   persist({selection: {clear: true}});
   if (hadDraftSelection) partnerSelections?.changed({clear: true});
   syncDetailSelection();

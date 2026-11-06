@@ -1,7 +1,7 @@
 import { createJSONBudget, readBoundedJSON } from './shared/json-budget.mjs';
 import { importReviewBackup, canRestoreReviewSnapshot, restoreReviewSnapshot } from './shared/review-import.mjs';
 import { commonIndexedProfiles } from './shared/common-render-profiles.mjs';
-import { exportAssetIndex, reviewBackupIdentity, reviewExportBlob, reviewStateSnapshot } from './shared/review-export.mjs';
+import { exportAssetIndex, reviewBackupIdentity, reviewExportBlob, reviewSnapshotBlob, reviewStateSnapshot } from './shared/review-export.mjs';
 import { describePreviewFailure, showPreviewFailure } from './shared/preview-failure-5e4d0bcf88f3.mjs';
 import { guardStartup } from './shared/startup-state.mjs';
 import { mountPartnerSelections } from './shared/selection-client.mjs';
@@ -290,6 +290,8 @@ function normalizeObject(record, basesById, basesBySourceId) {
     isObject: true,
     category: objectCategory(merged),
     modelUrl: record.assemblyModelUrl || record.modelUrl || record.materialModelUrl || base.modelUrl,
+    modelAsset: record.modelAsset || (record.assemblyModelUrl || record.modelUrl || record.materialModelUrl ? undefined : base.modelAsset),
+    variants: record.variants || (record.assemblyModelUrl || record.modelUrl || record.materialModelUrl ? [] : base.variants),
     previewUrl: record.previewUrl || record.thumbnailUrl || base.previewUrl,
     notes: Array.isArray(record.notes) ? record.notes : Array.isArray(base.notes) ? base.notes : [],
     provenance: record.provenance || base.provenance || {},
@@ -841,7 +843,7 @@ function applyAnimationFrame(state) {
   try {
     for (const viewer of [viewerA, viewerB]) {
       if (!viewer) continue;
-      if (state.clipId) viewer.setAnimationTime?.(state.clipId, state.time);else viewer.resetAnimation?.();
+      if (state.clipId) viewer.setAnimationTime?.(state.clipId, state.time, {reframe: state.reason === 'seek'});else viewer.resetAnimation?.();
     }
   } catch (error) {
     pausePlayback();
@@ -1117,7 +1119,7 @@ async function openDetail(item) {
   previewQueue?.cancel();
   if (current) saveComment();
   current = item;
-  currentVariant = (item.variants || []).find(v => v.modelAsset === item.modelAsset) || (item.variants || [])[0] || null;
+  currentVariant = (item.variants || []).find(v => item.modelAsset ? v.modelAsset === item.modelAsset : v.modelUrl === item.modelUrl) || (item.variants || [])[0] || null;
   const variants = $('#resource-variant');
   variants.hidden = !(item.variants || []).length;
   variants.innerHTML = (item.variants || []).map(v => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join('');
@@ -1368,13 +1370,20 @@ function exportReviewSnapshot() {
     showToast('资产目录尚未载入，不能导出可恢复快照');
     return;
   }
-  const {blob, restorable} = reviewExportBlob(reviewStateSnapshot(config, reviews, selected), config);
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const intent = current && commentDirty && $('#comment').value !== commentBaseline
+    ? {patch: {id: current.id, comment: $('#comment').value, updatedAt: new Date().toISOString()}} : {};
+  const latest = reviewWriter.snapshot({reviews, selected, legacySelected}, intent);
+  const known = new Set(itemMap.keys());
+  const snapshotReviews = sanitizeReviews(latest.reviews, known);
+  const snapshotSelected = latest.selected.filter(id => known.has(id));
+  const {blob, restorable} = reviewSnapshotBlob(reviewStateSnapshot(config, snapshotReviews, snapshotSelected), config);
   if (!restorable) {
     alert(`完整审阅快照超过 ${config.importLimitMiB} MiB 导入上限，未导出可恢复备份。请保留当前浏览器状态，不要清理或替换；需要维护者协助处理。`);
     return;
   }
   download(`${config.exportPrefix}_ReviewSnapshot_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
-  showToast('完整审阅快照已导出（审阅和选择，不含资产索引或模型）');
+  showToast(latest.ok ? '完整审阅快照已导出（审阅和选择，不含资产索引或模型）' : '已导出可读取的审阅快照；存储不可用或损坏，无法确认其他标签页的最新更改');
 }
 function exportCSV() {
   const rows = [['ID', 'Name', 'Type', 'Source file', 'Path ID', 'Vertices', 'Triangles', 'Preview mode', 'Review', 'Comment'], ...items.filter(a => selected.has(a.id)).map(a => [a.id, a.name, a.type, a.provenance?.sourceFile, a.provenance?.pathId, a.vertexCount, a.triangleCount, previewLabel(a), REVIEW_STATUSES[reviewOf(a).status], reviewOf(a).comment])];

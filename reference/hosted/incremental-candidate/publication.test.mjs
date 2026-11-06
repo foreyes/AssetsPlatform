@@ -46,11 +46,27 @@ test('directory accepts all 128 active scopes plus fixed entries, rejects overfl
  const e=environment(t);seedScopes(e,128);const directory=await (await projectDirectory(e.env)).json();assert.equal(directory.projects.length,MAX_DIRECTORY_PROJECTS);assert.equal(resolveProjectDirectory(directory).id,'entity');
  e.db.prepare('INSERT INTO ingest_active VALUES(?,?,?,?)').run('Sulfur','overflow','v-'+'f'.repeat(64),1);await assert.rejects(projectDirectory(e.env),/Directory unavailable/);
 });
+test('a new scope at capacity fails at begin without storing a plan or touching objects',async t=>{
+ const e=environment(t),b=await bundle('over-capacity');
+ seedScopes(e,MAX_ACTIVE_DATASETS);
+ const calls=[];
+ t.mock.method(e.env.BUCKET,'get',async()=>assert.fail('unexpected object read'));
+ t.mock.method(e.env.BUCKET,'put',async()=>assert.fail('unexpected object write'));
+ await assert.rejects(applyIncremental({bundle:b,call:async(name,args)=>{
+  calls.push(name);
+  return e.call(name.slice('entity_assets_'.length),args);
+ }}),/ingest-budget/);
+ assert.deepEqual(calls,['entity_assets_begin']);
+ assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_plans').get().n,0);
+ await assert.rejects(e.call('begin',{manifest:b.manifest,baseVersion:'v-'+'f'.repeat(64)}),/ingest-baseline-conflict/);
+});
 test('atomic last-slot admission permits one new scope and permits existing updates/replays at capacity',async t=>{
  const e=environment(t);seedScopes(e,127);const a=await bundle('lastA'),b=await bundle('lastB');await prepare(e,a);await prepare(e,b);
  const results=await Promise.allSettled([e.call('finalize',a.args),e.call('finalize',b.args)]);assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.match(results.find(r=>r.status==='rejected').reason.message,/ingest-budget/);assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_active').get().n,MAX_ACTIVE_DATASETS);
  const winner=results[0].status==='fulfilled'?a:b,loser=winner===a?b:a;assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_versions WHERE version=?').get(loser.v.version).n,0);
  const next=await bundle(winner.args.datasetId,'Next');await prepare(e,next,winner.v.version);assert.equal((await e.call('finalize',next.args)).revision,2);assert.equal((await e.call('finalize',winner.args)).ready,true);assert.equal((await e.call('status',winner.args)).activeVersion,next.v.version);
+ const historical=await e.call('begin',{manifest:winner.manifest,baseVersion:null});
+ assert.equal(historical.noop,true);assert.equal(historical.activeVersion,next.v.version);
 });
 test('historical publication replays keep B active, validate receipts, and stale uncommitted plans reject',async t=>{
  const e=environment(t),a=await bundle(),b=await bundle('synthetic','B'),stale=await bundle('synthetic','stale');await prepare(e,a);await prepare(e,stale);await e.call('finalize',a.args);await prepare(e,b,a.v.version);await e.call('finalize',b.args);

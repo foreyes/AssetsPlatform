@@ -64,6 +64,25 @@ export function createReviewWriter(storage, config) {
  let reviewPending = [], selectionPending = [];
  return {
   reset() { reviewPending = []; selectionPending = []; },
+  snapshot(fallback, intent = {}) {
+   // A missing key cannot establish that the visible state was intentionally cleared.
+   const latest = loadReviewState({getItem(key) {
+    const value = storage.getItem(key);
+    if (typeof value !== 'string' || !value.trim()) throw Error('Stored review snapshot is missing or blank');
+    if (key === config.reviewKey) {
+     const raw = JSON.parse(value);
+     if (raw?.version !== 1 || !raw.reviews || typeof raw.reviews !== 'object' || Array.isArray(raw.reviews) || !Array.isArray(raw.selected)) throw Error('Stored review snapshot lacks a valid envelope');
+    }
+    return value;
+   }}, config);
+   const ownsSelection = !!config.selectionStorageKey || !config.sharedSelections;
+   const reviews = applyReviews(latest.reviewOK ? latest.reviews : fallback.reviews, [...reviewPending, intent]);
+   const selected = config.sharedSelections && (fallback.accountSelection || !config.selectionStorageKey) ? [...fallback.selected] : config.selectionStorageKey
+    ? applySelections(latest.selectionOK ? latest.selected : fallback.selected, selectionPending)
+    : applySelections(latest.reviewOK ? latest.selected : fallback.selected,
+      ownsSelection ? reviewPending.flatMap(change => change.selection ? [change.selection] : []) : []);
+   return {reviews, selected, ok: latest.ok};
+  },
   save(intent, fallback) {
    const ownsSelection = !!config.selectionStorageKey || !config.sharedSelections;
    if (intent.patch || intent.reviews || (intent.selection && ownsSelection)) reviewPending.push(intent);

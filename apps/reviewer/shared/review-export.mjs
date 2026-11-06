@@ -19,6 +19,10 @@ export function reviewExportBlob(payload, config) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type: 'application/json'});
   return {blob, restorable: blob.size <= config.importLimitMiB * 1024 * 1024};
 }
+export function reviewSnapshotBlob(payload, config) {
+  const blob = new Blob([JSON.stringify(payload)], {type: 'application/json'});
+  return {blob, restorable: blob.size <= config.importLimitMiB * 1024 * 1024};
+}
 export function reviewStateSnapshot(config, reviews, selected) {
   return {...reviewBackupIdentity(config), exportedAt: new Date().toISOString(), scope: 'full-catalogue', reviews, selected: [...selected]};
 }

@@ -91,14 +91,14 @@ test('adapter clears ready and old snapshot on loss, reports UI error and rebuil
 test('hosted UI exposes loss and retries only the current detail request', async () => {
   const app=await readFile(new URL('review-frontend/shared/app.mjs',source),'utf8');
   const start=app.indexOf('  const onViewerError ='),end=app.indexOf('  try {\n    const modelUrl',start);
-  const nodes=new Map(), $=id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);};
+  const nodes=new Map(), $=id=>{if(!nodes.has(id))nodes.set(id,{append:button=>buttons.push(button)});return nodes.get(id);};
   const buttons=[], abort=new AbortController();let retries=0,pauses=0;
   const build=new Function('$','document','stageA','abort','pausePlayback','startViewers',`let request=1,viewerRequest=1;${app.slice(start,end)}return {onViewerError,stale(){viewerRequest++}};`);
-  const ui=build($,{createElement:()=>({})},{append:button=>buttons.push(button)},abort,()=>pauses++,()=>retries++);
+  const ui=build($,{createElement:()=>({})},{append:()=>assert.fail('Retry must be outside clipped stage')},abort,()=>pauses++,()=>retries++);
   ui.onViewerError({code:'WEBGL_CONTEXT_LOST',message:'context lost'});
   assert.equal($('#preview-caption').textContent,'context lost');assert.equal($('#animation-controls').hidden,true);assert.equal(pauses,1);
-  buttons[0].onclick();assert.equal(retries,1);ui.stale();buttons[0].onclick();assert.equal(retries,1);
-  ui.onViewerError({code:'WEBGL_CONTEXT_LOST'});assert.equal(buttons.length,1);
+  $('#retry-preview').onclick();assert.equal(retries,1);ui.stale();$('#retry-preview').onclick();assert.equal(retries,1);
+  ui.onViewerError({code:'WEBGL_CONTEXT_LOST'});assert.equal($('#retry-preview').hidden,false);
 });
 
 test('detail waiting for the renderer receives a retryable loss without releasing the active owner', async t => {

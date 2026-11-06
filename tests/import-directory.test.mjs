@@ -84,6 +84,46 @@ test('unsafe IDs, symlinks, overlapping paths and oversized GLBs are refused',()
  }finally{clean(x);}
 });
 
+test('lexical source and repository boundaries survive a directory mount', t=>{
+ const x=setup();
+ try {
+  const sourceMount=path.join(x.source,'mounted');
+  const repositoryMount=path.join(root,'scripts');
+  fs.mkdirSync(sourceMount);
+  const outputParents=[sourceMount,repositoryMount];
+  const caseAlias=path.join(x.dir,'SOURCE','mounted');
+  if(process.platform==='win32'&&fs.existsSync(caseAlias))outputParents.push(caseAlias);
+  const nestedSource=path.join(sourceMount,'nested');
+  fs.mkdirSync(nestedSource);
+  const nativeRealpath=fs.realpathSync.native;
+  t.mock.method(fs.realpathSync,'native',file=>{
+   // NTFS folder-mounted volumes can report a directory to lstat but resolve
+   // under a different drive root. Redirect only the paths that model mounts.
+   if(outputParents.includes(file)||file===nestedSource)return x.dir;
+   return nativeRealpath(file);
+  });
+  for(const outputParent of outputParents){
+   const output=path.join(outputParent,path.basename(x.dir)+'-output');
+   assert.throws(()=>importDirectory({...x,output}),/outside source and platform repository/);
+   assert(!fs.existsSync(output));
+  }
+  assert.throws(()=>importDirectory({...x,source:nestedSource,output:sourceMount}),/outside source and platform repository/);
+ }finally{clean(x);}
+});
+
+test('a case-distinct directory is usable when the filesystem gives it a separate identity', t=>{
+ const x=setup();
+ try {
+  const sibling=path.join(x.dir,'SOURCE');
+  if(fs.existsSync(sibling)){t.skip('temporary filesystem is case-insensitive');return;}
+  fs.mkdirSync(sibling);
+  fs.writeFileSync(path.join(x.source,'cube.glb'),cube);
+  const output=path.join(sibling,'output');
+  assert.equal(importDirectory({...x,output}).models,1);
+  assert(fs.existsSync(path.join(output,'import-report.json')));
+ }finally{clean(x);}
+});
+
 test('duplicate JSON chunks cannot bypass self-contained URI screening',()=>{
  const x=setup();try {
   const size=cube.readUInt32LE(12);const doc=JSON.parse(cube.subarray(20,20+size).toString());doc.buffers[0].uri='https://invalid.example/private.bin';

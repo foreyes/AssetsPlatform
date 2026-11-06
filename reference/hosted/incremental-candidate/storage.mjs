@@ -12,6 +12,10 @@ export function createIncrementalStorage(){
  async function bounded(object,size,sha){if(!object||object.size!==size||!object.body)fail('integrity');const r=object.body.getReader(),out=new Uint8Array(size);let n=0;for(;;){const c=await r.read();if(c.done)break;if(n+c.value.length>size){await r.cancel();fail('integrity')}out.set(c.value,n);n+=c.value.length}if(n!==size||await hash(out)!==sha)fail('integrity');return out}
  const params=v=>[v.manifest.projectId,v.manifest.datasetId,v.version];
  async function active(env,p,d){return await env.DB.prepare('SELECT version,revision FROM ingest_active WHERE project=? AND dataset=?').bind(p,d).first()}
+ async function atCapacityForNewScope(env,p,d){
+  const row=await env.DB.prepare('SELECT NOT EXISTS(SELECT 1 FROM ingest_active WHERE project=? AND dataset=?) AND (SELECT COUNT(*) FROM ingest_active)>=? AS full').bind(p,d,MAX_ACTIVE_DATASETS).first();
+  return row.full===1;
+ }
  async function plan(env,a){scope(a.projectId,a.datasetId);const row=await env.DB.prepare('SELECT manifest_sha,base_version,manifest_json FROM ingest_plans WHERE project=? AND dataset=? AND version=?').bind(a.projectId,a.datasetId,a.version).first();if(!row)fail('plan-missing');const v=await validateManifest(JSON.parse(row.manifest_json));if(v.version!==a.version||v.sha256!==row.manifest_sha)fail('conflict');return {...v,baseVersion:row.base_version}}
  const blockOf=(v,sha)=>{const bs=v.unique.flatMap(f=>f.blocks).filter(b=>b.sha256===sha);if(!bs.length||bs.some(b=>b.bytes!==bs[0].bytes))fail('undeclared');return bs[0]};
  const fileOf=(v,sha)=>v.unique.find(f=>f.sha256===sha)||fail('undeclared');
@@ -29,6 +33,8 @@ export function createIncrementalStorage(){
   const receipt=await published(env,v);if(receipt)return {...receipt,noop:true,contentWrites:0};
   const current=await active(env,p,d);
   if((current?.version??null)!==a.baseVersion){const committed=await published(env,v);if(committed)return {...committed,noop:true,contentWrites:0};fail('baseline-conflict')}
+  // Avoid upload work when no slot is available. Finalize still admits atomically.
+  if(!current&&await atCapacityForNewScope(env,p,d))fail('budget');
   await env.DB.prepare('INSERT INTO ingest_plans(project,dataset,version,manifest_sha,base_version,manifest_json) VALUES(?,?,?,?,?,?) ON CONFLICT(project,dataset,version) DO NOTHING').bind(p,d,v.version,v.sha256,a.baseVersion,canonical(v.manifest)).run();
   const committed=await published(env,v);if(committed)return {...committed,noop:true,contentWrites:0};
   const saved=await plan(env,{projectId:p,datasetId:d,version:v.version});if(saved.baseVersion!==a.baseVersion)fail('conflict');
@@ -51,8 +57,7 @@ export function createIncrementalStorage(){
   env.DB.prepare('INSERT INTO ingest_active(project,dataset,version,revision) SELECT ?,?,?,1 WHERE changes()=1 ON CONFLICT(project,dataset) DO UPDATE SET version=excluded.version,revision=ingest_active.revision+1').bind(...params(v))
  ]);
  const committed=await published(env,v);if(committed)return committed;
- const current=await active(env,a.projectId,a.datasetId);
- if(!current){const count=await env.DB.prepare('SELECT COUNT(*) AS count FROM ingest_active').bind().first();if(count.count>=MAX_ACTIVE_DATASETS)fail('budget')}
+ if(await atCapacityForNewScope(env,a.projectId,a.datasetId))fail('budget');
  fail('baseline-conflict');
  }
  async function call(name,a,env){if(!env.DB||!env.BUCKET)fail('bindings');return ({begin,status,check_block:checkBlock,check_file:checkFile,put_block:putBlock,commit_file:commitFile,finalize})[name.slice('entity_assets_'.length)](env,a)}

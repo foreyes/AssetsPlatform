@@ -90,6 +90,17 @@ for (const mode of ['public', 'hosted']) test(mode + ' resolver and loader assig
   assert.equal(equal.resolve('literal~1.glb'),'http://localhost/b/literal~1.glb');
   assert.equal(equal.resolve('./literal:name.glb'),'http://localhost/b/literal:name.glb');
   assert.equal(equal.resolve('folder./asset.glb'),'http://localhost/b/folder./asset.glb');
+  const encoded=createResourceResolver({
+    assetRoot:'http://localhost/%62/',
+    registeredProjectRoots:['http://localhost/','http://localhost/b//','http://localhost/b/Data/private/','https://example.test/b/Data/'],
+    resourceMounts:[{logicalPrefix:'/assets/',target:'Default/'},{logicalPrefix:'/assets/models/',target:'Data/'}]
+  });
+  assert.equal(encoded.resolve('/%61ssets/models/item%23one.glb#preview'),'http://localhost/%62/Data/item%23one.glb#preview');
+  assert.equal(encoded.resolve('/assets/modelsExtra/item.glb'),'http://localhost/%62/Default/modelsExtra/item.glb');
+  assert.equal(encoded.resolve('/b/Data/private-next/item.glb'),'http://localhost/b/Data/private-next/item.glb');
+  assert.throws(()=>encoded.resolve('/assets/models/%70rivate/item.glb'),/Cross-project/);
+  const ambiguous=createResourceResolver({assetRoot:'http://localhost/b/',registeredProjectRoots:['http://localhost/B/']});
+  assert.throws(()=>ambiguous.resolve('own.glb'),/case alias/);
   let loader=await fs.readFile(new URL('project-loader.mjs',folder),'utf8');
   loader=loader.replace(/from '(\.\/[^']+)'/g,(_,relative)=>'from '+JSON.stringify(relative==='./resource-url.mjs'?resolverURL:new URL(relative,folder).href));
   const {loadProject:load}=await import('data:text/javascript;base64,'+Buffer.from(loader).toString('base64'));

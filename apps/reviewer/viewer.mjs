@@ -599,8 +599,7 @@ export function createSourceAnimation(geometry,data) {
     }
     return fallback;
   }
-  function framePose(clipId,bounds) {
-    const candidate=getFraming(clipId);
+  function fitPose(clipId,bounds,candidate=getFraming(clipId)) {
     if(!bounds)return candidate;
     // Playback already computed these bounds. Validate a sidecar against the
     // actual pose without another geometry pass or trusting metadata alone.
@@ -609,6 +608,10 @@ export function createSourceAnimation(geometry,data) {
     if(contains&&radius*candidate.scale<=1.25+1e-5)return candidate;
     const center=bounds.min.map((value,i)=>(value+bounds.max[i])/2),poseRadius=Math.hypot(...bounds.min.map((value,i)=>(bounds.max[i]-value)/2));
     const framing={center,scale:Math.min(1,1.25/Math.max(poseRadius*1.04,1e-5)),bounds:{min:bounds.min.slice(),max:bounds.max.slice()},clipId,sampleCount:0,approximate:true,reason:'起始姿态取景；未扫描完整动画，后续运动可能超出画面'};
+    return framing;
+  }
+  function framePose(clipId,bounds) {
+    const framing=fitPose(clipId,bounds);
     framingCache.set(clipId,framing);return {...framing,center:framing.center.slice()};
   }
   async function prepareFraming(clipId=clips[0]?.id,{signal}={}) {
@@ -637,7 +640,7 @@ export function createSourceAnimation(geometry,data) {
     const framing={center,scale:Math.min(1,1.25/Math.max(radius*1.04,1e-5)),sampleCount,bounds:{min,max},clipId,approximate:true,reason:'有限采样的固定取景；未覆盖的运动可能超出画面'};
     framingCache.set(clipId,framing);return {...framing,center:framing.center.slice()};
   }
-  return {clips,diagnostics,sample,getFraming,framePose,prepareFraming,getNodeWorldMatrices(){return playback.lastWorlds?new Map([...playback.lastWorlds].map(([k,v])=>[k,v.slice()])):null;},reset(){playback.state=null;return geometry;},getState(){return playback.state?{...playback.state}:null;}};
+  return {clips,diagnostics,sample,getFraming,fitPose,framePose,prepareFraming,getNodeWorldMatrices(){return playback.lastWorlds?new Map([...playback.lastWorlds].map(([k,v])=>[k,v.slice()])):null;},reset(){playback.state=null;return geometry;},getState(){return playback.state?{...playback.state}:null;}};
 }
 
 // A compact linear-light material shader, not a Unity/URP or full PBR implementation.
@@ -862,7 +865,7 @@ export async function createViewer(container,url,options={}) {
   Object.assign(canvas.style,{display:'block',width:'100%',height:'100%',touchAction:'none'});
   container.replaceChildren(canvas);
   const abort=new AbortController(),cleanups=[],decodedImages=[];
-  let framingJob=null;
+  let framingJob=null,seekBounds=null,seekFrame=null;
   let disposed=false,contextLost=false,ready=false,geometry,animation=null,animationFrame={center:[0,0,0],scale:1},gpu=null,resize=null,frame=0,drag=null,isWire=false;
   let camera=sanitizeCamera(options.camera),profile=prepareProfile(options.profile),materialRules=prepareMaterialRules(options.materialRules);
   const gl=canvas.getContext('webgl',{antialias:true,alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:!!options._sharedResources});
@@ -916,7 +919,9 @@ export async function createViewer(container,url,options={}) {
     const job=new AbortController();framingJob=job;
     animation.prepareFraming(clipId,{signal:job.signal}).then(result=>{
       if(!alive()||job.signal.aborted||framingJob!==job)return;
-      if(result.sampleCount)animationFrame=result;framingJob=null;requestDraw();
+      if(result.sampleCount)animationFrame=result;
+      if(seekBounds)seekFrame=animation.fitPose(clipId,seekBounds,animationFrame);
+      framingJob=null;requestDraw();
     }).catch(error=>{if(error.name!=='AbortError'&&!job.signal.aborted&&framingJob===job&&alive()){framingJob=null;showStatus(error.message);options.onError?.(error);}});
   }
   function notifyCamera(){if(alive()&&typeof options.onCameraChange==='function')options.onCameraChange({...camera});}
@@ -925,23 +930,30 @@ export async function createViewer(container,url,options={}) {
     setMaterialRules(value){materialRules=prepareMaterialRules(value);requestDraw();},
     getAnimationClips(){return animation?.clips.map(clip=>({...clip,limitations:clip.limitations.slice()}))||[];},
     getAnimationState(){return animation?.getState()||null;},
-    getAnimationFraming(){return {...animationFrame,center:animationFrame.center.slice()};},
-    setAnimationTime(clipId,time){
+    getAnimationFraming(){const displayed=seekFrame||animationFrame;return {...displayed,center:displayed.center.slice()};},
+    setAnimationTime(clipId,time,{reframe=false}={}){
       if(!alive()||!animation)throw Error('动画预览尚未就绪或已经关闭');
       // Only the app owns playback time. Both views receive this same absolute seek.
       try{
         // Reframe once on clip selection, never on the shared clock's frame ticks.
         const changed=animation.getState()?.clipId!==clipId;
         const next=clipId===null?animation.reset():animation.sample(clipId,time);
+        seekBounds=null;seekFrame=null;
         if(changed)selectFraming(clipId,next.posedBounds);
-        else if(animationFrame.precomputed&&!animation.framePose(clipId,next.posedBounds).precomputed)selectFraming(clipId,next.posedBounds);
-        else if(framingJob&&!animationFrame.sampleCount)animationFrame=animation.framePose(clipId,next.posedBounds);
+        else if(animationFrame.precomputed&&!animation.fitPose(clipId,next.posedBounds,animationFrame).precomputed)selectFraming(clipId,next.posedBounds);
+        else if(!reframe&&framingJob&&!animationFrame.sampleCount)animationFrame=animation.framePose(clipId,next.posedBounds);
+        if(reframe&&next.posedBounds){
+          // The paused seek is a display override, never an input to the fixed
+          // sweep or its cache. Ordinary clock ticks return to the stable frame.
+          seekBounds={min:next.posedBounds.min.slice(),max:next.posedBounds.max.slice()};
+          seekFrame=animation.fitPose(clipId,seekBounds,animationFrame);
+        }
         applyAnimationGeometry(next);
       }
       catch(error){applyAnimationGeometry(animation.reset());throw error;}
       return animation.getState();
     },
-    resetAnimation(){if(alive()&&animation){selectFraming(null);applyAnimationGeometry(animation.reset());}},
+    resetAnimation(){if(alive()&&animation){seekBounds=null;seekFrame=null;selectFraming(null);applyAnimationGeometry(animation.reset());}},
     getAnimationDiagnostics(){return animation?.diagnostics.map(item=>({...item}))||[];},
     get animationWarnings(){return animation?.diagnostics.map(item=>({...item}))||[];},
     // Programmatic camera updates are silent, avoiding feedback loops between two viewers.
@@ -1020,8 +1032,9 @@ export async function createViewer(container,url,options={}) {
     gl.viewport(0,0,width,height);gl.clearColor(0,0,0,0);gl.depthMask(true);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.useProgram(gpu.program);
     const {yaw,pitch,zoom}=camera,cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
     const ry=[cy,0,-sy,0,0,1,0,0,sy,0,cy,0,0,0,0,1],rx=[1,0,0,0,0,cp,sp,0,0,-sp,cp,0,0,0,0,1],view=identity();view[14]=-zoom*Math.max(1,height/width);
-    const fit=identity();fit[0]=fit[5]=fit[10]=animationFrame.scale;
-    for(let axis=0;axis<3;axis++)fit[12+axis]=-animationFrame.center[axis]*animationFrame.scale;
+    const displayed=seekFrame||animationFrame;
+    const fit=identity();fit[0]=fit[5]=fit[10]=displayed.scale;
+    for(let axis=0;axis<3;axis++)fit[12+axis]=-displayed.center[axis]*displayed.scale;
     const mv=multiply(view,multiply(multiply(rx,ry),fit)),f=2.25,near=0.01,far=100,projection=[f/(width/height),0,0,0,0,f,0,0,0,0,(far+near)/(near-far),-1,0,0,2*far*near/(near-far),0],loc=gpu.loc,p=profile.parameters;
     gl.uniformMatrix4fv(loc.uMVP,false,new Float32Array(multiply(projection,mv)));gl.uniformMatrix4fv(loc.uModelView,false,new Float32Array(mv));
     for(const [key,value]of [['uLightDirection',p.lightDirection],['uAmbientColor',p.ambientColor],['uKeyColor',p.keyLightColor],['uShadowColor',p.shadowColor],['uBaseTint',p.baseTint]])gl.uniform3fv(loc[key],value);

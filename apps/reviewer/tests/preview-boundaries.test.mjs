@@ -195,18 +195,22 @@ test('restoring saved timeline time before first RAF fits the pending pose witho
     const {data}=animatedModel();data.clips=data.clips.slice(0,1);data.clips[0].duration=1;data.clips[0].tracks[0].times=[0,1];
     globalThis.fetch=async()=>new Response(bytes);
     const viewer=await createViewer(container,'fixture.glb',{_canvas:canvas,animationData:data});
-    const timeline=createPlaybackTimeline({onFrame:state=>viewer.setAnimationTime(state.clipId,state.time)});
+    const comparison=await createViewer({...container},'fixture.glb',{_canvas:{...canvas,style:{}},animationData:data});
+    const timeline=createPlaybackTimeline({onFrame:state=>{
+      for(const target of [viewer,comparison])target.setAnimationTime(state.clipId,state.time,{reframe:state.reason==='seek'});
+    }});
     try{
       const camera=viewer.getCamera();
       timeline.configure(viewer.getAnimationClips());timeline.select('move');timeline.seek(1);
       const first=viewer.getAnimationFraming();
-      assert.equal(first.sampleCount,0);assert.equal(first.center[0],20);
+      assert.equal(first.sampleCount,0);assert.equal(first.center[0],20);assert.deepEqual(comparison.getAnimationFraming(),first);
       assert(Math.abs(20-first.center[0])*first.scale<1.25);assert.deepEqual(viewer.getCamera(),camera);
       // The original job completes rather than being restarted by restored seeks.
-      for(let i=0;i<100&&viewer.getAnimationFraming().sampleCount!==17;i++)await new Promise(resolve=>setTimeout(resolve,10));
+      for(let i=0;i<100&&(viewer.getAnimationFraming().sampleCount!==17||comparison.getAnimationFraming().sampleCount!==17);i++)await new Promise(resolve=>setTimeout(resolve,10));
       const final=viewer.getAnimationFraming();assert.equal(final.sampleCount,17);assert.equal(final.center[0],10);
       assert.deepEqual(viewer.getCamera(),camera);assert.equal(viewer.getAnimationState().time,1);
-    }finally{timeline.dispose();viewer.dispose();}
+      assert.deepEqual(comparison.getAnimationFraming(),final);assert.deepEqual(comparison.getAnimationState(),viewer.getAnimationState());assert.deepEqual(comparison.getCamera(),camera);
+    }finally{timeline.dispose();viewer.dispose();comparison.dispose();}
   });
 });
 
@@ -235,4 +239,65 @@ test('two real viewers publish the same completed sweep despite staggered playba
       assert.deepEqual(left.getCamera(),right.getCamera());
     }finally{leftTimeline.dispose();rightTimeline.dispose();left.dispose();right.dispose();}
   });
+});
+
+for(const large of [false,true])test('explicit seek fits current pose after bounded framing without changing camera '+large,async()=>{
+ await withViewerPlatform(async({container,canvas})=>{
+  const bytes=model(json=>{json.extras={sourceId:'fixture'};json.nodes[0].extras={sourceId:'node0'};if(large){json.nodes.push(...Array.from({length:257},()=>({})));}});
+  const {data}=animatedModel();data.clips=data.clips.slice(0,1);
+  // A narrow key between the bounded scan samples is still a legitimate seek.
+  data.clips[0].tracks[0].times=[0,0.123,0.124,10];data.clips[0].tracks[0].values=[[0,0,0],[100,0,0],[0,0,0],[0,0,0]];
+  globalThis.fetch=async()=>new Response(bytes);
+  const viewer=await createViewer(container,'seek.glb',{_canvas:canvas,animationData:data});
+  const timeline=createPlaybackTimeline({onFrame:state=>viewer.setAnimationTime(state.clipId,state.time,{reframe:state.reason==='seek'})});
+  try{
+   timeline.configure(viewer.getAnimationClips());await new Promise(resolve=>setTimeout(resolve,5));
+   for(let attempt=0;!large&&viewer.getAnimationFraming().sampleCount===0&&attempt<100;attempt++)await new Promise(resolve=>setTimeout(resolve,10));
+   const camera=viewer.getCamera(),fixed=viewer.getAnimationFraming();
+   viewer.setAnimationTime('move',0.123);assert.deepEqual(viewer.getAnimationFraming(),fixed);
+   timeline.seek(0.123);const framing=viewer.getAnimationFraming();assert(Math.abs(100-framing.center[0])*framing.scale<1.25);
+   assert.deepEqual(viewer.getCamera(),camera);await new Promise(resolve=>setTimeout(resolve,20));assert.deepEqual(viewer.getAnimationFraming(),framing);
+   timeline.play();assert.deepEqual(viewer.getAnimationFraming(),fixed);assert.deepEqual(viewer.getCamera(),camera);
+  }finally{timeline.dispose();viewer.dispose();}
+ });
+});
+
+test('paused early seek remains visible after the fixed sweep and playback returns both views to it',async()=>{
+ await withViewerPlatform(async({container,canvas})=>{
+  const bytes=model(json=>{json.extras={sourceId:'fixture'};json.nodes[0].extras={sourceId:'node0'};});
+  const {data}=animatedModel();data.clips=data.clips.slice(0,1);data.clips[0].duration=1;
+  data.clips[0].tracks[0].times=[0,1/32,1/16,1];data.clips[0].tracks[0].values=[[0,0,0],[100,0,0],[0,0,0],[0,0,0]];
+  globalThis.fetch=async()=>new Response(bytes);
+  const left=await createViewer(container,'fixture.glb',{_canvas:canvas,animationData:data});
+  const right=await createViewer({...container},'fixture.glb',{_canvas:{...canvas,style:{}},animationData:data});
+  const timeline=createPlaybackTimeline({onFrame:state=>{for(const viewer of [left,right])viewer.setAnimationTime(state.clipId,state.time,{reframe:state.reason==='seek'});}});
+  try{
+   timeline.configure(left.getAnimationClips());timeline.select('move');timeline.seek(1/32);
+   const camera=left.getCamera();assert.equal(left.getAnimationFraming().center[0],100);
+   await new Promise(resolve=>setTimeout(resolve,1000));
+   assert.equal(timeline.getState().playing,false);assert.equal(left.getAnimationFraming().center[0],100);
+   assert.deepEqual(left.getAnimationFraming(),right.getAnimationFraming());assert.deepEqual(left.getCamera(),camera);
+   timeline.play();const stable=left.getAnimationFraming();assert.equal(stable.sampleCount,17);assert.equal(stable.center[0],0);
+   assert.deepEqual(stable,right.getAnimationFraming());assert.deepEqual(right.getCamera(),camera);
+   timeline.pause();timeline.seek(1/32);assert.equal(left.getAnimationFraming().center[0],100);
+   timeline.play();assert.deepEqual(left.getAnimationFraming(),stable);
+  }finally{timeline.dispose();left.dispose();right.dispose();}
+ });
+});
+
+test('explicit seek invalidates a stale precomputed sidecar and still schedules its bounded replacement',async()=>{
+ await withViewerPlatform(async({container,canvas})=>{
+  const bytes=model(json=>{json.extras={sourceId:'fixture'};json.nodes[0].extras={sourceId:'node0'};});
+  const {data}=animatedModel();data.clips=data.clips.slice(0,1);
+  data.precomputedFraming={move:{modelSHA256:'model',canonicalSHA256:'move',clipId:'move',center:[0,0,0],scale:0.6,sampleCount:100,bounds:{min:[-1,-1,-1],max:[1,1,1]}}};
+  globalThis.fetch=async()=>new Response(bytes);
+  const viewer=await createViewer(container,'fixture.glb',{_canvas:canvas,animationData:data});
+  const timeline=createPlaybackTimeline({onFrame:state=>viewer.setAnimationTime(state.clipId,state.time,{reframe:state.reason==='seek'})});
+  try{
+   timeline.configure(viewer.getAnimationClips());assert.equal(viewer.getAnimationFraming().precomputed,true);
+   timeline.seek(10);assert.equal(viewer.getAnimationFraming().center[0],20);
+   for(let i=0;i<100&&viewer.getAnimationFraming().sampleCount!==17;i++)await new Promise(resolve=>setTimeout(resolve,10));
+   assert.equal(viewer.getAnimationFraming().sampleCount,17);assert.equal(viewer.getAnimationFraming().precomputed,undefined);
+  }finally{timeline.dispose();viewer.dispose();}
+ });
 });

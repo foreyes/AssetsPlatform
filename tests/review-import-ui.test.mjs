@@ -160,11 +160,12 @@ async function boot(t, mode, {
   };
   const requests = [];
   let listRequests = 0;
-  const fetch = async (path, { method = 'GET', body: requestBody } = {}) => {
-    requests.push([path, method, requestBody]);
+  const fetch = async (path, { method = 'GET', body: requestBody, signal } = {}) => {
+    requests.push([path, method, requestBody, signal]);
     let body;
     if (Object.hasOwn(responses, path)) {
       body = await responses[path](requestBody);
+      if (body instanceof Response) return body;
       return new Response(JSON.stringify(body));
     }
     switch (path) {
@@ -248,6 +249,11 @@ async function boot(t, mode, {
   assert.match(source, projectImport);
   assert.match(source, viewerImport);
   assert.match(source, /init\(\);\s*$/);
+  const selectionClientSource = mode === 'hosted' ? await readFile(new URL('shared/selection-client.mjs', root), 'utf8') : null;
+  const selectionClientURL = selectionClientSource && 'data:text/javascript;base64,' + Buffer.from(
+    'const {setTimeout, clearTimeout} = globalThis.__importFixture;\n' + selectionClientSource.replace(/from '(\.\/[^']+)'/g,
+      (_, path) => 'from ' + JSON.stringify(new URL(path, new URL('shared/', root)).href))
+  ).toString('base64') + '#' + ++fixtureId;
   const script = source
     .replace(projectImport, `
       const loadProject = async () => globalThis.__importFixture.project;
@@ -257,6 +263,7 @@ async function boot(t, mode, {
     `)
     .replace(viewerImport, 'const { createViewer, describeDownload, downloadResource } = globalThis.__importFixture; const configureRenderer = async () => {};')
     .replace(/from '(\.\/shared\/[^']+)'/g, (_, path) => {
+      if (path === './shared/selection-client.mjs' && selectionClientURL) return 'from ' + JSON.stringify(selectionClientURL);
       // The hosted resolver imports generated private pins. This fixture has no native assets.
       const moduleRoot = path === './shared/resource-url.mjs' ? reviewer.public : root;
       return 'from ' + JSON.stringify(new URL(path, moduleRoot).href);
@@ -303,6 +310,7 @@ async function boot(t, mode, {
       get('#comment').oninput();
     },
     commentTimers: () => [...timers.values()].filter(timer => timer.delay === 350),
+    sessionTimers: () => [...timers.values()].filter(timer => timer.delay === 10000),
     toast: () => get('#toast').textContent
   };
 }
@@ -1062,12 +1070,15 @@ test('public full review snapshot round-trips exact and merge without report ind
 
 test('public oversized report warns before download; oversized UTF-8 state refuses backup success', async t => {
   const h = await boot(t, 'public'); await h.ready();
-  h.app.reviews.one.comment = '中文'.repeat(100);
-  const {reviewStateSnapshot, reviewExportBlob} = await import('../apps/reviewer/shared/review-export.mjs');
-  const payload = reviewStateSnapshot(h.config, h.app.reviews, h.app.selected);
-  const text = JSON.stringify(payload, null, 2), bytes = new Blob([text]).size;
+  const stored = h.stored();
+  stored.reviews.one.comment = '中文'.repeat(100);
+  h.values.set(h.config.reviewKey, JSON.stringify(stored));
+  const {reviewStateSnapshot, reviewExportBlob, reviewSnapshotBlob} = await import('../apps/reviewer/shared/review-export.mjs');
+  const payload = reviewStateSnapshot(h.config, stored.reviews, h.app.selected);
+  const text = JSON.stringify(payload), bytes = reviewSnapshotBlob(payload, h.config).blob.size;
   assert(bytes > text.length);
   h.config.importLimitMiB = (text.length + 1) / 1024 / 1024;
+  assert.equal(reviewSnapshotBlob(payload, h.config).restorable, false);
   assert.equal(reviewExportBlob(payload, h.config).restorable, false);
   h.get('#export-snapshot').onclick();
   assert.equal(h.downloads.length, 0); assert.match(h.alerts[0], /未导出可恢复备份/);
@@ -1596,3 +1607,544 @@ test('hosted clean publish trims nickname without creating false load confirmati
   await control('load').onclick();
   assert.equal(h.confirmations.length, 0);
 });
+
+test('hosted ordinary edits keep the revision belonging to stale stored IDs', async t => {
+  const mine = {userId: 'reviewer', ids: [libraryAsset.id], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine},
+    responses: {'/api/selections/me': () => new Response(JSON.stringify({error: 'conflict'}), {status: 409})}});
+  await h.ready();
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  h.values.set(key, JSON.stringify({ids: [asset.id], nickname: 'Old draft', baseRevision: 1}));
+  const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+  control('nickname').value = 'Edited old draft';
+  control('nickname').oninput();
+  assert.equal(JSON.parse(h.values.get(key)).baseRevision, 1);
+  await control('publish').onclick();
+  assert.deepEqual(JSON.parse(h.requests.find(([path]) => path === '/api/selections/me')[2]),
+    {ids: [asset.id], nickname: 'Edited old draft', revision: 1});
+  assert.match(control('status').textContent, /服务器版本已变化/);
+});
+
+for (const interveningRevision of [1, 7]) {
+  test(`hosted failed Load cannot replace intervening draft write at revision ${interveningRevision}`, async t => {
+    const storageValues = new Map(), key = 'asset-review-selection-v1:fixture:reviewer';
+    const mine = {userId: 'reviewer', ids: [libraryAsset.id], nickname: 'Server', revision: 7};
+    storageValues.set(key, JSON.stringify({ids: [asset.id], nickname: 'Before', baseRevision: 1}));
+    const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine},
+      responses: {'/api/selections': () => ({lists: [mine]})}};
+    const a = await boot(t, 'hosted', options);
+    await a.ready();
+    const b = await boot(t, 'hosted', options);
+    await b.ready();
+    const control = (tab, id) => tab.get('main > header').following.querySelector('#partner-' + id);
+    a.activate();
+    a.setStorageError(key);
+    await control(a, 'load').onclick();
+    b.activate();
+    if (interveningRevision === 7) await control(b, 'load').onclick();
+    b.get('#clear-selection').onclick();
+    control(b, 'nickname').value = 'Intervening B';
+    control(b, 'nickname').oninput();
+    a.activate();
+    a.setStorageError(undefined);
+    control(a, 'nickname').value = 'After failed load';
+    control(a, 'nickname').oninput();
+    const saved = JSON.parse(storageValues.get(key));
+    assert.deepEqual(saved.ids, []);
+    assert.equal(saved.baseRevision, interveningRevision);
+    assert.deepEqual([...a.app.selected], []);
+    assert.equal(saved.nickname, 'After failed load');
+  });
+}
+
+test('hosted ACK does not relabel an explicit server replacement made during PUT', async t => {
+  const storageValues = new Map(), put = deferred(), key = 'asset-review-selection-v1:fixture:reviewer';
+  const mine = {userId: 'reviewer', ids: [], nickname: 'Server', revision: 1};
+  const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine}, responses: {
+    '/api/selections': () => ({lists: [mine]}), '/api/selections/me': () => put.promise
+  }};
+  const a = await boot(t, 'hosted', options);
+  await a.ready();
+  const b = await boot(t, 'hosted', options);
+  await b.ready();
+  const control = (tab, id) => tab.get('main > header').following.querySelector('#partner-' + id);
+  a.activate();
+  a.cardCheckbox().onchange({target: {checked: true}});
+  const publishing = control(a, 'publish').onclick();
+  b.activate();
+  await control(b, 'load').onclick();
+  a.activate();
+  put.resolve({mine: {...mine, ids: [asset.id], revision: 2}});
+  await publishing;
+  const saved = JSON.parse(storageValues.get(key));
+  assert.deepEqual(saved.ids, []);
+  assert.equal(saved.baseRevision, 1);
+  assert.match(control(a, 'status').textContent, /未自动更新基线/);
+});
+
+test('hosted retains unknown IDs through hydration, edits, explicit Load and publication', async t => {
+  let mine = {userId: 'reviewer', ids: ['new-catalogue-item'], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine}, responses: {
+    '/api/selections': () => ({lists: [mine]}),
+    '/api/selections/me': body => {mine = {...mine, ...JSON.parse(body), revision: mine.revision + 1}; return {mine};}
+  }});
+  await h.ready();
+  assert(!h.app.selected.has('new-catalogue-item'), 'unavailable IDs stay outside the visible selection');
+  const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+  control('nickname').value = 'New name';
+  control('nickname').oninput();
+  await control('publish').onclick();
+  assert.deepEqual(mine.ids, ['new-catalogue-item']);
+  await control('load').onclick();
+  h.cardCheckbox().onchange({target: {checked: true}});
+  await control('publish').onclick();
+  assert.deepEqual(new Set(mine.ids), new Set(['new-catalogue-item', asset.id]));
+});
+
+for (const hang of ['fetch', 'body']) {
+  test(`hosted session ${hang} deadline unlocks local selection and aborts the request`, async t => {
+    const pending = deferred();
+    const h = await boot(t, 'hosted', {shared: true, responses: {
+      '/api/selection/session': () => hang === 'fetch' ? pending.promise : new Response(new ReadableStream())
+    }});
+    const ready = h.ready();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.get('#import-btn').disabled, true);
+    const session = h.requests.find(([path]) => path === '/api/selection/session');
+    assert(session);
+    h.sessionTimers()[0].run();
+    await ready;
+    assert.equal(session[3].aborted, true);
+    assert.equal(h.get('#import-btn').disabled, false);
+    assert.match(h.get('main > header').following.querySelector('#partner-identity').textContent, /无法核验/);
+    h.cardCheckbox().onchange({target: {checked: true}});
+    assert(h.app.selected.has(asset.id));
+    assert(!h.requests.some(([path]) => path === '/api/selections'));
+    pending.resolve({userId: 'late-account', mine: {ids: []}});
+    await new Promise(resolve => setImmediate(resolve));
+    assert(h.app.selected.has(asset.id), 'late identity response must not overwrite the unlocked local draft');
+  });
+}
+
+for (const firstAction of ['checkbox', 'review', 'partner copy', 'legacy import']) {
+  test(`hosted preserves server-only IDs after first ${firstAction} before an account draft exists`, async t => {
+    let mine = {userId: 'reviewer', ids: ['unavailable-asset'], nickname: 'Server', revision: 1};
+    const partner = {userId: 'other', ids: [asset.id], nickname: 'Partner', revision: 1};
+    const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine}, responses: {
+      '/api/selections': () => ({lists: [partner]}),
+      '/api/selections/me': body => {mine = {...mine, ...JSON.parse(body), revision: 2}; return {mine};}
+    }});
+    if (firstAction === 'legacy import') {
+      const stored = h.stored();
+      stored.selected = [asset.id];
+      h.values.set(h.config.reviewKey, JSON.stringify(stored));
+    }
+    await h.ready();
+    await new Promise(resolve => setImmediate(resolve));
+    const key = 'asset-review-selection-v1:fixture:reviewer';
+    assert(!h.values.has(key));
+    assert.deepEqual([...h.app.selected], []);
+    const panel = h.get('main > header').following;
+    if (firstAction === 'checkbox') h.cardCheckbox().onchange({target: {checked: true}});
+    if (firstAction === 'review') {
+      await h.app.openDetail(h.app.itemMap.get(asset.id));
+      h.buttons[1].onclick();
+    }
+    if (firstAction === 'partner copy') panel.querySelector('#partner-lists').children[0].querySelector('[data-copy]').onclick();
+    if (firstAction === 'legacy import') panel.querySelector('#partner-legacy').onclick();
+    assert(!h.app.selected.has('unavailable-asset'));
+    await panel.querySelector('#partner-publish').onclick();
+    const expected = firstAction === 'review' ? ['unavailable-asset'] : ['unavailable-asset', asset.id];
+    assert.deepEqual(new Set(mine.ids), new Set(expected));
+    assert.deepEqual(new Set(JSON.parse(h.values.get(key)).ids), new Set(expected));
+  });
+}
+
+test('hosted incomplete local manifest exports restorable review state with unavailable IDs retained', async t => {
+  const mine = {userId: 'reviewer', ids: ['unavailable-asset'], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine}});
+  await h.ready();
+  const panel = h.get('main > header').following;
+  await panel.querySelector('#partner-export').onclick();
+  assert.equal(h.downloads.length, 1);
+  const backup = JSON.parse(await h.downloads[0].blob.text());
+  assert.equal(backup.version, 2);
+  assert.equal(backup.scope, 'full-catalogue');
+  assert.deepEqual(backup.selected, mine.ids);
+  assert(!('assets' in backup));
+  assert.match(panel.querySelector('#partner-status').textContent, /manifest 未完成.*不恢复账号或昵称.*待目录恢复后再导入/);
+  const restored = await boot(t, 'hosted', {catalogObjects: [asset, {id: 'unavailable-asset', name: 'Returned asset'}]});
+  await restored.ready();
+  await restored.choose(async () => JSON.stringify(backup));
+  assert(restored.app.selected.has('unavailable-asset'));
+});
+
+test('hosted recovery exports compact bounded state and round-trips despite a large catalogue', async t => {
+  const catalogObjects = [asset, ...Array.from({length: 6000}, (_, i) => ({id: 'extra-' + i, name: 'Long catalogue name '.repeat(20)}))];
+  const h = await boot(t, 'hosted', {shared: true, catalogObjects,
+    responses: {'/api/selection/session': () => new Promise(() => {})}});
+  const ready = h.ready();
+  await new Promise(resolve => setImmediate(resolve));
+  h.sessionTimers()[0].run();
+  await ready;
+  h.config.importLimitMiB = 1;
+  h.cardCheckbox().onchange({target: {checked: true}});
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.edit('Still typing');
+  const recovery = h.get('main > header').following.children.find(child => child.id === 'partner-recovery-export');
+  recovery.onclick();
+  assert.equal(h.downloads.length, 1);
+  assert(h.downloads[0].blob.size < 1024 * 1024);
+  const text = await h.downloads[0].blob.text(), backup = JSON.parse(text);
+  assert.equal(backup.scope, 'full-catalogue');
+  assert.deepEqual(backup.selected, [asset.id]);
+  assert.equal(backup.reviews[asset.id].comment, 'Still typing');
+  for (const key of ['assets', 'animationPreviewRecords', 'actionLibraryRecords']) assert(!(key in backup));
+  const restored = await boot(t, 'hosted', {catalogObjects});
+  await restored.ready();
+  restored.config.importLimitMiB = 1;
+  await restored.choose(async () => text);
+  assert.deepEqual([...restored.app.selected], [asset.id]);
+  assert.equal(restored.app.reviews[asset.id].comment, 'Still typing');
+  h.activate();
+  h.edit('中文'.repeat(200000));
+  recovery.onclick();
+  assert.equal(h.downloads.length, 1, 'oversized UTF-8 state must not be labelled recoverable');
+  assert.match(h.alerts.at(-1), /未导出可恢复备份.*不要刷新或关闭/);
+});
+
+test('hosted recovery reads latest reviews and pending edits without replacing authoritative account selections', async t => {
+  const mine = {userId: 'reviewer', ids: ['unavailable-asset'], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, initialSelection: [asset.id], sharedSession: {userId: 'reviewer', mine}});
+  await h.ready();
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.setStorageError(h.config.reviewKey);
+  h.buttons[1].onclick();
+  h.edit('Pending textarea');
+  const latest = h.stored();
+  latest.reviews[asset.id] = {status: 'skip', comment: 'External'};
+  latest.reviews['unavailable-review'] = {status: 'keep', comment: 'Preserve external unknown review'};
+  h.values.set(h.config.reviewKey, JSON.stringify(latest));
+  const bytes = h.values.get(h.config.reviewKey);
+  const exportButton = h.get('main > header').following.querySelector('#partner-export');
+  await exportButton.onclick();
+  let backup = JSON.parse(await h.downloads[0].blob.text());
+  assert.deepEqual(backup.selected, ['unavailable-asset']);
+  assert.equal(backup.reviews[asset.id].status, 'check');
+  assert.equal(backup.reviews[asset.id].comment, 'Pending textarea');
+  assert.deepEqual(backup.reviews['unavailable-review'], latest.reviews['unavailable-review']);
+  assert.equal(h.values.get(h.config.reviewKey), bytes);
+  assert.equal(h.commentTimers().length, 1);
+  h.values.set(h.config.reviewKey, '{broken');
+  await exportButton.onclick();
+  backup = JSON.parse(await h.downloads[1].blob.text());
+  assert.equal(backup.reviews[asset.id].comment, 'Pending textarea');
+  assert.deepEqual(backup.selected, ['unavailable-asset']);
+  assert.match(backup.warnings[0], /无法确认其他标签页/);
+  assert.equal(h.values.get(h.config.reviewKey), '{broken');
+  h.values.delete(h.config.reviewKey);
+  await exportButton.onclick();
+  backup = JSON.parse(await h.downloads[2].blob.text());
+  assert.equal(backup.reviews[asset.id].status, 'check');
+  assert.match(backup.warnings[0], /无法确认其他标签页/);
+});
+
+test('hosted signed-in direct backup preserves failed writes even while manifest delivery hangs', async t => {
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  const delivery = deferred();
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine},
+    responses: {'/delivery-index.json': () => delivery.promise}});
+  await h.ready();
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.setStorageError(h.config.reviewKey);
+  h.buttons[1].onclick();
+  h.edit('Unsaved while signed in');
+  const panel = h.get('main > header').following;
+  const manifest = panel.querySelector('#partner-export').onclick();
+  const requestCount = h.requests.length;
+  const recovery = panel.children.find(child => child.id === 'partner-recovery-export');
+  assert(recovery);
+  recovery.onclick();
+  assert.equal(h.requests.length, requestCount, 'direct backup must not fetch any delivery information');
+  assert.equal(h.downloads.length, 1);
+  const backup = JSON.parse(await h.downloads[0].blob.text());
+  assert.equal(backup.reviews[asset.id].status, 'check');
+  assert.equal(backup.reviews[asset.id].comment, 'Unsaved while signed in');
+  assert.deepEqual(backup.selected, [asset.id]);
+  delivery.resolve({assets: {}});
+  await manifest;
+});
+
+test('hosted unauthenticated split-key recovery reads latest local selections plus failed intents', async t => {
+  const h = await boot(t, 'hosted', {shared: true, initialSelection: [],
+    catalogObjects: [asset, {...libraryAsset, name: 'Other'}],
+    responses: {'/api/selection/session': () => {throw Error('Offline');}}});
+  await h.ready();
+  h.values.set(h.config.selectionStorageKey, JSON.stringify([libraryAsset.id]));
+  h.setStorageError(h.config.selectionStorageKey);
+  h.card(asset.id).querySelector('.card-check').onchange({target: {checked: true}});
+  const recovery = h.get('main > header').following.children.find(child => child.id === 'partner-recovery-export');
+  recovery.onclick();
+  const backup = JSON.parse(await h.downloads[0].blob.text());
+  assert.deepEqual(new Set(backup.selected), new Set([asset.id, libraryAsset.id]));
+  assert.deepEqual(JSON.parse(h.values.get(h.config.selectionStorageKey)), [libraryAsset.id]);
+});
+
+for (const bytes of ['', '  ', '{}', 'null', '{"version":1}', '{"version":1,"reviews":{}}', '{"version":1,"reviews":{},"selected":[]}']) {
+  test(`hosted recovery distinguishes ${JSON.stringify(bytes)} from a valid empty review envelope`, async t => {
+    const h = await boot(t, 'hosted', {shared: true, initialSelection: [],
+      responses: {'/api/selection/session': () => {throw Error('Offline');}}});
+    await h.ready();
+    h.cardCheckbox().onchange({target: {checked: true}});
+    h.values.set(h.config.reviewKey, bytes);
+    const validEmpty = bytes === '{"version":1,"reviews":{},"selected":[]}';
+    h.values.set(h.config.selectionStorageKey, validEmpty ? '[]' : '  ');
+    const recovery = h.get('main > header').following.children.find(child => child.id === 'partner-recovery-export');
+    recovery.onclick();
+    const backup = JSON.parse(await h.downloads[0].blob.text());
+    if (validEmpty) {
+      assert.deepEqual(backup.reviews, {});
+      assert.deepEqual(backup.selected, []);
+      assert.deepEqual(backup.warnings, []);
+    } else {
+      assert.equal(backup.reviews[asset.id].comment, oldReview.comment);
+      assert.deepEqual(backup.selected, [asset.id]);
+      assert.match(backup.warnings[0], /无法确认其他标签页/);
+    }
+  });
+}
+
+test('hosted authenticated backup reads another tab additions/removals and pending account edits without writing', async t => {
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  const third = {id: 'third', name: 'Third'};
+  const storageValues = new Map(), key = 'asset-review-selection-v1:fixture:reviewer';
+  const options = {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine},
+    catalogObjects: [asset, {...libraryAsset, name: 'Other'}, third]};
+  const a = await boot(t, 'hosted', options);
+  await a.ready();
+  const b = await boot(t, 'hosted', options);
+  await b.ready();
+  const recovery = a.get('main > header').following.children.find(child => child.id === 'partner-recovery-export');
+  b.card(asset.id).querySelector('.card-check').onchange({target: {checked: false}});
+  b.card(libraryAsset.id).querySelector('.card-check').onchange({target: {checked: true}});
+  a.activate();
+  recovery.onclick();
+  let backup = JSON.parse(await a.downloads[0].blob.text());
+  assert.deepEqual(backup.selected, [libraryAsset.id]);
+  a.setStorageError(key);
+  a.card(third.id).querySelector('.card-check').onchange({target: {checked: true}});
+  const bytes = storageValues.get(key), calls = a.calls.length;
+  recovery.onclick();
+  backup = JSON.parse(await a.downloads[1].blob.text());
+  assert.deepEqual(new Set(backup.selected), new Set([libraryAsset.id, third.id]));
+  assert.equal(a.calls.length, calls);
+  assert.equal(storageValues.get(key), bytes);
+  storageValues.set(key, '{broken');
+  recovery.onclick();
+  backup = JSON.parse(await a.downloads[2].blob.text());
+  assert.deepEqual(new Set(backup.selected), new Set([asset.id, third.id]));
+  assert.match(backup.warnings[0], /无法确认其他标签页/);
+  storageValues.set(key, bytes);
+  a.setStorageError(undefined);
+  const nickname = a.get('main > header').following.querySelector('#partner-nickname');
+  nickname.value = 'Recover pending';
+  nickname.oninput();
+  assert.deepEqual(new Set(JSON.parse(storageValues.get(key)).ids), new Set([libraryAsset.id, third.id]));
+});
+
+test('hosted backup retains a confirmed failed Load without consuming it and ignores reverted comment input', async t => {
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine},
+    responses: {'/api/selections': () => ({lists: [mine]})}});
+  await h.ready();
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  h.edit('Changed');
+  h.edit(oldReview.comment);
+  const latest = h.stored();
+  latest.reviews[asset.id].comment = 'Other tab current text';
+  h.values.set(h.config.reviewKey, JSON.stringify(latest));
+  h.values.set(key, '{broken');
+  h.setStorageError(key);
+  const panel = h.get('main > header').following;
+  await panel.querySelector('#partner-load').onclick();
+  panel.children.find(child => child.id === 'partner-recovery-export').onclick();
+  const backup = JSON.parse(await h.downloads[0].blob.text());
+  assert.deepEqual(backup.selected, mine.ids);
+  assert.equal(backup.reviews[asset.id].comment, 'Other tab current text');
+  assert.equal(h.values.get(key), '{broken');
+  h.setStorageError(undefined);
+  panel.querySelector('#partner-nickname').value = 'Retry';
+  panel.querySelector('#partner-nickname').oninput();
+  assert.deepEqual(JSON.parse(h.values.get(key)).ids, mine.ids);
+});
+
+test('hosted backup preserves visible confirmed Load when original storage bytes could not be read', async t => {
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, sharedSession: {userId: 'reviewer', mine},
+    responses: {'/api/selections': () => ({lists: [mine]})}});
+  await h.ready();
+  const stale = JSON.stringify({ids: [], nickname: 'Old persisted draft', baseRevision: 1});
+  h.values.set(key, stale);
+  h.setStorageError('method');
+  const panel = h.get('main > header').following;
+  await panel.querySelector('#partner-load').onclick();
+  assert.match(h.confirmations[0], /无法读取当前浏览器草稿/);
+  assert.deepEqual([...h.app.selected], mine.ids);
+  h.setStorageError(undefined);
+  panel.children.find(child => child.id === 'partner-recovery-export').onclick();
+  const backup = JSON.parse(await h.downloads[0].blob.text());
+  assert.deepEqual(backup.selected, mine.ids);
+  assert.match(backup.warnings[0], /无法确认其他标签页/);
+  assert.equal(h.values.get(key), stale, 'read-only backup must not authorize replacing previously unreadable bytes');
+});
+
+test('hosted confirmed Load retries unchanged malformed bytes after a temporary write failure', async t => {
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+  const h = await boot(t, 'hosted', {shared: true, storageValues: new Map([[key, '{broken']]),
+    sharedSession: {userId: 'reviewer', mine}, responses: {'/api/selections': () => ({lists: [mine]})}});
+  await h.ready();
+  const control = id => h.get('main > header').following.querySelector('#partner-' + id);
+  h.setStorageError(key);
+  await control('load').onclick();
+  assert.match(h.confirmations[0], /无法读取当前浏览器草稿/);
+  assert.equal(h.values.get(key), '{broken');
+  h.setStorageError(undefined);
+  control('nickname').value = 'Retry confirmed load';
+  control('nickname').oninput();
+  assert.deepEqual(JSON.parse(h.values.get(key)).ids, mine.ids);
+  assert.equal(JSON.parse(h.values.get(key)).baseRevision, 2);
+  assert.equal(control('status').following.hidden, true);
+  h.values.set(key, '{broken-again');
+  h.setStorageError(key);
+  await control('load').onclick();
+  h.setStorageError(undefined);
+  h.values.set(key, '{intervening-write');
+  control('nickname').value = 'Must not replace intervening bytes';
+  control('nickname').oninput();
+  assert.equal(h.values.get(key), '{intervening-write');
+  assert.equal(control('status').following.hidden, false);
+});
+
+for (const split of [false, true]) {
+  test(`hosted session timeout exposes recovery and accurately labels ${split ? 'independent local storage' : 'volatile selection'}`, async t => {
+    const h = await boot(t, 'hosted', {shared: true, ...(split ? {initialSelection: []} : {}),
+      responses: {'/api/selection/session': () => new Promise(() => {})}});
+    const ready = h.ready();
+    await new Promise(resolve => setImmediate(resolve));
+    h.sessionTimers()[0].run();
+    await ready;
+    const panel = h.get('main > header').following;
+    const status = panel.querySelector('#partner-status');
+    const warning = status.textContent;
+    if (split) assert.match(warning, /本浏览器本地存储/);
+    else assert.match(warning, /仅保留在此页面.*关闭或刷新会丢失/);
+    assert.doesNotMatch(panel.querySelector('#partner-identity').textContent, /请重新登录后刷新/);
+    h.cardCheckbox().onchange({target: {checked: true}});
+    await h.app.openDetail(h.app.itemMap.get(asset.id));
+    h.buttons[1].onclick();
+    assert.equal(status.textContent, warning, 'ordinary edits must not dismiss the persistence warning');
+    if (split) assert.deepEqual(JSON.parse(h.values.get(h.config.selectionStorageKey)), [asset.id]);
+    const recovery = panel.children.find(child => child.id === 'partner-recovery-export');
+    assert(recovery, 'recovery must be visible without authenticated account controls');
+    recovery.onclick();
+    const backup = JSON.parse(await h.downloads[0].blob.text());
+    assert.deepEqual(backup.selected, [asset.id]);
+    assert.equal(backup.reviews[asset.id].status, 'check');
+    assert.equal(status.textContent, warning);
+    assert(!h.values.has('asset-review-selection-v1:fixture:reviewer'));
+  });
+}
+
+test('hosted successful PUT advances the live draft while repeated storage writes fail', async t => {
+  let mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 1};
+  const key = 'asset-review-selection-v1:fixture:reviewer';
+  const storageValues = new Map([[key, JSON.stringify({ids: mine.ids, nickname: mine.nickname, baseRevision: 1})]]);
+  const h = await boot(t, 'hosted', {shared: true, storageValues, sharedSession: {userId: 'reviewer', mine}, responses: {
+    '/api/selections/me': body => {
+      const submitted = JSON.parse(body);
+      assert.equal(submitted.revision, mine.revision);
+      mine = {...mine, ...submitted, revision: mine.revision + 1};
+      return {mine};
+    }
+  }});
+  await h.ready();
+  const panel = h.get('main > header').following;
+  h.setStorageError(key);
+  await panel.querySelector('#partner-publish').onclick();
+  await panel.querySelector('#partner-publish').onclick();
+  assert.equal(mine.revision, 3);
+  assert.equal(JSON.parse(h.values.get(key)).baseRevision, 1);
+  assert.equal(panel.querySelector('#partner-status').following.hidden, false);
+  h.setStorageError(undefined);
+  panel.querySelector('#partner-nickname').value = 'Recovered storage';
+  panel.querySelector('#partner-nickname').oninput();
+  assert.equal(JSON.parse(h.values.get(key)).baseRevision, 3);
+});
+
+for (const invalid of [{ids: 3}, {ids: [null]}, {ids: [], nickname: {}}, {ids: [], baseRevision: '1'}]) {
+  test(`hosted invalid account draft ${JSON.stringify(invalid)} keeps identity controls and recovery available`, async t => {
+    const key = 'asset-review-selection-v1:fixture:reviewer', bytes = JSON.stringify(invalid);
+    const mine = {userId: 'reviewer', ids: [asset.id], nickname: 'Server', revision: 2};
+    const h = await boot(t, 'hosted', {shared: true, storageValues: new Map([[key, bytes]]),
+      sharedSession: {userId: 'reviewer', mine}, responses: {'/api/selections': () => ({lists: [mine]})}});
+    await h.ready();
+    const panel = h.get('main > header').following;
+    assert.equal(panel.querySelector('#partner-controls').hidden, false);
+    assert.match(panel.querySelector('#partner-identity').textContent, /reviewer/);
+    assert.equal(panel.querySelector('#partner-status').following.hidden, false);
+    assert.equal(h.values.get(key), bytes);
+    assert.deepEqual([...h.app.selected], mine.ids);
+    await panel.querySelector('#partner-load').onclick();
+    assert.match(h.confirmations[0], /无法读取当前浏览器草稿/);
+    assert.deepEqual(JSON.parse(h.values.get(key)).ids, mine.ids);
+  });
+}
+
+
+test('public snapshot click rebases stored data and pending editor intent without a storage write',async t=>{
+ const h=await boot(t,'public',{catalogObjects:[asset,{id:'two',name:'Second'}]});await h.ready();
+ await h.app.openDetail(h.app.itemMap.get(asset.id));
+ const latest=h.stored();latest.reviews.one={status:'skip',comment:'External'};latest.reviews.two={status:'keep',comment:'New'};latest.selected=['two'];
+ h.values.set(h.config.reviewKey,JSON.stringify(latest));
+ h.get('#export-snapshot').onclick();
+ let payload=JSON.parse(await h.downloads[0].blob.text());assert.equal(payload.reviews.one.comment,'External');assert.deepEqual(payload.selected,['two']);
+ h.setStorageError(h.config.reviewKey);h.buttons[1].onclick();
+ h.get('#detail-selected').onchange({target:{checked:true}});h.edit('Dirty textarea');
+ const before=h.values.get(h.config.reviewKey);h.get('#export-snapshot').onclick();
+ payload=JSON.parse(await h.downloads[1].blob.text());assert.equal(payload.reviews.one.comment,'Dirty textarea');assert.equal(payload.reviews.one.status,'check');assert.deepEqual(new Set(payload.selected),new Set(['one','two']));
+ assert.equal(h.values.get(h.config.reviewKey),before);assert.equal(h.commentTimers().length,1);
+ h.values.set(h.config.reviewKey,'{corrupt');h.get('#export-snapshot').onclick();
+ payload=JSON.parse(await h.downloads[2].blob.text());assert.equal(payload.reviews.one.comment,'Dirty textarea');assert.match(h.toast(),/无法确认/);assert.equal(h.values.get(h.config.reviewKey),'{corrupt');
+});
+for(const mode of Object.keys(reviewer))test(mode+' opens explicit assembly model instead of inherited fragment variant',async t=>{
+ const previews=[];
+ const h=await boot(t,mode,{catalogAssets:[{id:'fragment',name:'Fragment',modelUrl:'/review/fragment.glb',variants:[{id:'v',modelUrl:'/review/fragment-variant.glb'}]}],catalogObjects:[{...asset,assetId:'fragment',assemblyModelUrl:'/review/assembly.glb'}],createViewer:async(stage,url)=>{previews.push(url);return {dispose(){}};}});
+ await h.ready();await h.app.openDetail(h.app.itemMap.get(asset.id));assert.equal(previews.at(-1),'/review/assembly.glb');assert.equal(h.get('#resource-variant').hidden,true);
+});
+
+for (const sameModel of [true, false]) {
+  test(`hosted explicit object model ${sameModel ? 'retains a matching' : 'rejects a mismatched'} base download declaration`, async t => {
+    const declaration = {format: 'glb', name: 'Base preview', preview_sha256: 'a'.repeat(64)};
+    const previews = [], downloads = [];
+    const h = await boot(t, 'hosted', {
+      catalogAssets: [{id: 'base', name: 'Base', modelUrl: '/review/base.glb', modelAsset: declaration,
+        variants: [{id: 'variant', modelUrl: '/review/variant.glb'}]}],
+      catalogObjects: [{...asset, assetId: 'base', modelUrl: sameModel ? 'base.glb' : 'different.glb'}],
+      createViewer: async (stage, url, options) => {previews.push({url, declaration: options.modelAsset}); return {dispose() {}};},
+      downloadResource: async value => {downloads.push(value); return {bytes: new Uint8Array(), filename: 'base.glb'};}
+    });
+    await h.ready();
+    await h.app.openDetail(h.app.itemMap.get(asset.id));
+    assert.equal(previews.at(-1).url, sameModel ? 'base.glb' : 'different.glb');
+    assert.deepEqual(previews.at(-1).declaration, sameModel ? declaration : undefined);
+    assert.equal(h.get('#resource-variant').hidden, true);
+    const button = h.get('#detail-downloads').querySelector('[data-verified-model-download]');
+    if (sameModel) {
+      await button.onclick();
+      assert.deepEqual(downloads, [declaration]);
+    } else assert.equal(button, undefined);
+  });
+}
