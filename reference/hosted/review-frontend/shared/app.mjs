@@ -7,7 +7,7 @@ import { guardStartup } from './shared/startup-state.mjs';
 import { mountPartnerSelections } from './shared/selection-client.mjs';
 let partnerSelections = null,
   legacySelected = [];
-import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentity, downloadResource } from './shared/viewer-adapter.mjs';
+import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentity, describeDownload, downloadResource } from './shared/viewer-adapter.mjs';
 import { createPreviewQueue } from './shared/preview-queue.mjs';
 import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
@@ -991,10 +991,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
   playback.configure([]);
   const item = current;
   if (!item) return;
-  const rendered = currentVariant ? {
-    ...item,
-    ...currentVariant
-  } : item;
+  const rendered = currentVariant || item;
   viewerLoading = true;
   $('#toggle-render-compare').disabled = true;
   const candidateRecord = item.isObject ? selectedAnimationRecord(item) : null;
@@ -1155,10 +1152,11 @@ async function openDetail(item) {
     warning.textContent = item.displayWarning;
     $('#assembly-evidence').append(warning);
   }
+  $('.detail-layout').scrollTop = 0;
   $('.detail-info').scrollTop = 0;
   loadObjectHierarchy(item);
   loadItemEvidence(item);
-  bindResourceDownloads(item, $('#detail-downloads'));
+  updateVerifiedModelDownload(currentVariant || item);
   await startViewers();
 }
 async function openResource(resource) {
@@ -1176,7 +1174,7 @@ async function openResource(resource) {
   $('#resource-title').textContent = resource.name;
   $('#resource-content').innerHTML = (resource.previewUrl ? imageHTML(resource, true) : '') + `<div class="detail-metrics">${metricHTML(resource)}</div><p class="resource-note">${esc(previewLabel(resource))}。${esc(resource.notes?.join('；') || '')}</p><dl>${provenanceHTML(resource)}</dl><div class="detail-downloads">${downloadsHTML(resource)}</div>`;
   $('#resource-modal').showModal();
-  bindResourceDownloads(resource, $('#resource-content'));
+  updateVerifiedModelDownload(resource, $('#resource-content'));
   if (resource.metadataUrl) {
     try {
       const metadata = await readJSON(resource.metadataUrl, true, {
@@ -1469,7 +1467,9 @@ $('#import-btn').onclick = () => $('#import-file').click();
 $('#mobile-import').onclick = () => $('#import-file').click();
 $('#mobile-audit').onclick = () => $('#audit-modal').showModal();
 $('#resource-variant').onchange = event => {
-  currentVariant = (current?.variants || []).find(v => v.id === event.target.value) || null;
+  if (!current) return;
+  currentVariant = (current.variants || []).find(v => v.id === event.target.value) || null;
+  updateVerifiedModelDownload(currentVariant || current);
   startViewers(false, false);
 };
 $('#detail-selected').onchange = event => {
@@ -1914,38 +1914,41 @@ async function loadItemEvidence(item) {
     container.textContent = '资源详情读取失败；原始目录与下载链接仍保留，请重新打开重试。';
   }
 }
-function bindResourceDownloads(item, container) {
-  if (!item.modelAsset || !['glb', 'gltf'].includes(item.modelAsset.format)) return;
-  const button = document.createElement('button');
-  button.className = 'light-btn';
-  button.textContent = '下载已校验的 ' + (item.modelAsset.format || '模型').toUpperCase();
-  if (item.modelAsset.format === 'gltf') {
-    button.disabled = true;
-    button.textContent = '闭合 glTF · 需保留完整依赖目录';
-    button.title = '此处不提供不完整的单文件下载；来源与依赖证据保留。';
+function updateVerifiedModelDownload(resource, container = $('#detail-downloads')) {
+  const previous = container.querySelector('[data-verified-model-download]');
+  const {modelAsset, resourceBaseUrl} = resource;
+  const target = describeDownload(modelAsset);
+  if (!target) {
+    previous?.remove();
+    return;
   }
+  const button = document.createElement('button');
+  button.dataset.verifiedModelDownload = '';
+  button.className = 'light-btn';
+  button.disabled = !target.supported;
+  button.textContent = target.supported ? '下载已校验的 ' + target.filename : target.label;
+  button.title = target.reason || target.filename;
   button.onclick = async () => {
     if (button.disabled) return;
     button.disabled = true;
     try {
-      const result = await downloadResource(item, {
-        resourceBaseUrl: item.resourceBaseUrl
-      });
+      const result = await downloadResource(modelAsset, {resourceBaseUrl});
       if (!result || result.supported === false) throw Error(result?.reason || '此格式未提供已验证下载');
       const url = URL.createObjectURL(result.blob || new Blob([result.bytes], {
           type: result.type || 'application/octet-stream'
         })),
         link = document.createElement('a');
       link.href = url;
-      link.download = result.filename || item.name;
+      link.download = result.filename || target.filename;
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
-      showToast('下载未完成：' + error.message);
+      if (button.isConnected && button.closest('dialog')?.open) showToast('下载未完成：' + error.message);
     } finally {
       button.disabled = false;
     }
   };
-  container.append(button);
+  if (previous) previous.replaceWith(button);
+  else container.append(button);
 }
 init();

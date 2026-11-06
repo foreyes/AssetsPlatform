@@ -17,4 +17,5 @@ export function rendererOptions(options={}){
 export function createViewer(host,url,options){if(!backend)throw Error('资源渲染器未初始化');return backend.createViewer(host,url,rendererOptions(options))}
 export function createThumbnailRenderer(options){if(!backend)throw Error('资源渲染器未初始化');const renderer=backend.createThumbnailRenderer(options);return {...renderer,...(renderer.prepare?{prepare:(url,request)=>renderer.prepare(url,rendererOptions(request))}:{}),render:(url,request)=>renderer.render(url,rendererOptions(request))}}
 export function renderIdentity(item,profile,materialRules){const normalized=rendererOptions({modelAsset:item.modelAsset,resourceBaseUrl:item.resourceBaseUrl});return configuration.projectId+':'+configuration.datasetId+':'+(backend.thumbnailIdentity?.(item.modelAsset?normalized:item,profile)||`${materialRules.version}:${profile.id}:${item.id}`)}
-export async function downloadResource(item,options){const asset=item.modelAsset||item;return backend.downloadResource?.(asset,rendererOptions({...options,modelAsset:asset}))}
+export function describeDownload(asset){return backend.describeDownload?.(asset)}
+export async function downloadResource(asset,options){return backend.downloadResource?.(asset,rendererOptions({...options,modelAsset:asset}))}

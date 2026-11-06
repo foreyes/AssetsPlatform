@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { resolveSelectionAssets } from '../reference/hosted/review-frontend/shared/selection-manifest.mjs';
+import { describeDownload } from '../reference/hosted/review-frontend/adapters/entity-viewer.mjs';
 
 const reviewer = {
   public: new URL('../apps/reviewer/', import.meta.url),
@@ -35,10 +36,25 @@ class Element {
     };
   }
   append(...children) {
+    for (const child of children) child.parent = this;
     this.children.push(...children);
   }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = undefined;
+  }
+  replaceWith(child) {
+    this.parent.children[this.parent.children.indexOf(this)] = child;
+    child.parent = this.parent;
+    this.parent = undefined;
+  }
+  get isConnected() { return !!this.parent; }
   replaceChildren(...children) { this.children = children; }
   querySelector(selector) {
+    if (selector === '[data-verified-model-download]') {
+      return this.children.find(child => Object.hasOwn(child.dataset, 'verifiedModelDownload'));
+    }
     if (!this.childrenBySelector) this.childrenBySelector = new Map();
     if (!this.childrenBySelector.has(selector)) this.childrenBySelector.set(selector, new Element());
     return this.childrenBySelector.get(selector);
@@ -64,7 +80,7 @@ class Element {
 let fixtureId = 0;
 async function boot(t, mode, {
   shared = false, sharedSession, sharedList, responses = {}, storageError, initialSelection,
-  catalogAssets = [], catalogObjects = [asset], createViewer
+  catalogAssets = [], catalogObjects = [asset], createViewer, downloadResource
 } = {}) {
   const root = reviewer[mode];
   const appRoot = mode === 'hosted' ? new URL('shared/', root) : root;
@@ -208,7 +224,7 @@ async function boot(t, mode, {
     } },
     location: { href: url, origin: config.origin, assign() {} }, localStorage, fetch, confirm, alert: message => alerts.push(message), URL: FixtureURL,
     __importFixture: {
-      project, catalogue, createViewer, setTimeout: (run, delay) => {
+      project, catalogue, createViewer, describeDownload, downloadResource, setTimeout: (run, delay) => {
         const timer = Symbol();
         timers.set(timer, { run, delay });
         return timer;
@@ -227,7 +243,7 @@ async function boot(t, mode, {
     t.after(() => previous ? Object.defineProperty(globalThis, name, previous) : delete globalThis[name]);
   }
   const projectImport = /import \{ loadProject, loadProjectData, objectCategory, assetURL \} from '[^']+';/;
-  const viewerImport = /import \{ createViewer, createThumbnailRenderer, configureRenderer, renderIdentity, downloadResource \} from '[^']+';/;
+  const viewerImport = /import \{ createViewer, createThumbnailRenderer, configureRenderer, renderIdentity, (?:describeDownload, )?downloadResource \} from '[^']+';/;
   assert.match(source, projectImport);
   assert.match(source, viewerImport);
   assert.match(source, /init\(\);\s*$/);
@@ -236,8 +252,9 @@ async function boot(t, mode, {
       const loadProject = async () => globalThis.__importFixture.project;
       const loadProjectData = () => globalThis.__importFixture.catalogue.promise;
       const objectCategory = item => item.category;
+      const assetURL = (config, path) => new URL(path, config.assetRoot).href;
     `)
-    .replace(viewerImport, 'const { createViewer } = globalThis.__importFixture; const configureRenderer = async () => {};')
+    .replace(viewerImport, 'const { createViewer, describeDownload, downloadResource } = globalThis.__importFixture; const configureRenderer = async () => {};')
     .replace(/from '(\.\/shared\/[^']+)'/g, (_, path) => {
       // The hosted resolver imports generated private pins. This fixture has no native assets.
       const moduleRoot = path === './shared/resource-url.mjs' ? reviewer.public : root;
@@ -436,6 +453,133 @@ for (const mode of Object.keys(reviewer)) {
     assert.equal(h.stored().reviews[asset.id].status, 'check');
   });
 }
+
+test('hosted technical resource modal loads material metadata and preserves download links', async t => {
+  const metadataUrl = 'https://fixture.invalid/review/material.json';
+  const material = {
+    id: 'material', name: 'Material', type: 'material', metadataUrl,
+    downloads: [{ kind: 'url', label: 'Source evidence', url: '/review/material-source.json' }]
+  };
+  const modelAsset = { format: 'glb', name: 'Fallback', preview_sha256: 'a'.repeat(64) };
+  const fallback = { id: 'fallback', name: 'Fallback', type: 'mesh', modelAsset, resourceBaseUrl: '/review/models/' };
+  const h = await boot(t, 'hosted', {
+    catalogAssets: [material, fallback],
+    responses: { [metadataUrl]: () => ({ floatParameters: { _Glossiness: 0.5 } }) },
+    downloadResource: async (declaration, {resourceBaseUrl}) => {
+      assert.equal(declaration, modelAsset);
+      assert.equal(resourceBaseUrl, fallback.resourceBaseUrl);
+      return { bytes: new Uint8Array([1]), filename: 'Fallback.glb' };
+    }
+  });
+  await h.ready();
+  await h.app.openResource(h.app.itemMap.get(material.id));
+  const content = h.get('#resource-content');
+  const button = () => content.querySelector('[data-verified-model-download]');
+  assert(h.get('#resource-modal').open);
+  assert.equal(h.get('#resource-title').textContent, material.name);
+  assert.match(content.innerHTML, /material\.json/);
+  assert.match(content.innerHTML, /material-source\.json/);
+  assert.equal(button(), undefined);
+  const parameters = content.children.find(section => section.className === 'source-parameters');
+  assert.equal(parameters.children[0].textContent, '源浮点参数');
+  assert.deepEqual(parameters.children[2].children.map(node => node.textContent), ['_Glossiness', '0.5']);
+
+  h.get('#resource-modal').close();
+  await h.app.openResource(h.app.itemMap.get(fallback.id));
+  assert(h.get('#resource-modal').open);
+  assert.equal(button().textContent, '下载已校验的 Fallback.glb');
+  await button().onclick();
+  assert.equal(h.downloads[0].name, 'Fallback.glb');
+});
+
+test('hosted variant preview and verified download share the active declaration and resource root', async t => {
+  const originalAsset = { format: 'glb', name: 'Original' };
+  const makeVariant = (id, format, name) => ({
+    id, label: id, modelUrl: `/review/${id}/model.${format}`, resourceBaseUrl: `/review/${id}/`,
+    modelAsset: { format, name, preview_sha256: id.repeat(64), originalAsset }
+  });
+  const a = makeVariant('a', 'glb', 'Preview A');
+  const b = makeVariant('b', 'gltf', 'Closed B');
+  const c = makeVariant('c', 'glb', 'Preview/C.GLB');
+  const item = {
+    ...asset, modelUrl: '/review/main.glb', resourceBaseUrl: '/review/main/', modelAsset: originalAsset, originalAsset,
+    variants: [a, b, c], metadataUrl: '/review/metadata.json',
+    downloads: [{ kind: 'url', label: 'Source evidence', url: '/review/source.json' }]
+  };
+  let pending = deferred();
+  const previews = [], requests = [];
+  const h = await boot(t, 'hosted', {
+    catalogObjects: [item],
+    createViewer: async (stage, url, options) => {
+      previews.push({ url, modelAsset: options.modelAsset, resourceBaseUrl: options.resourceBaseUrl });
+      return { dispose() {} };
+    },
+    downloadResource: async (declaration, options) => {
+      requests.push({ declaration, ...options });
+      if (declaration === a.modelAsset) await pending.promise;
+      return { bytes: new TextEncoder().encode(declaration.preview_sha256), filename: describeDownload(declaration).filename };
+    }
+  });
+  await h.ready();
+  await h.app.openDetail(h.app.itemMap.get(item.id));
+  const select = h.get('#resource-variant');
+  const container = h.get('#detail-downloads');
+  const button = () => container.querySelector('[data-verified-model-download]');
+  const activePreview = variant => assert.deepEqual(previews.at(-1), {
+    url: variant.modelUrl, modelAsset: variant.modelAsset, resourceBaseUrl: variant.resourceBaseUrl
+  });
+  const switchTo = variant => {
+    select.onchange({ target: { value: variant.id } });
+    activePreview(variant);
+  };
+  const sourceLinks = container.innerHTML;
+  assert.match(sourceLinks, /metadata\.json/);
+  assert.match(sourceLinks, /source\.json/);
+  const partner = new Element();
+  container.append(partner);
+  h.get('#comment').value = 'Keep this draft';
+  h.get('#detail-selected').onchange({ target: { checked: true } });
+  assert.equal(select.value, a.id);
+  activePreview(a);
+  assert.equal(button().textContent, '下载已校验的 Preview A.glb');
+  const first = button().onclick();
+  assert(button().disabled);
+  switchTo(b);
+  assert(button().disabled);
+  assert.match(button().textContent, /Closed B.*闭合 glTF/);
+  await button().onclick();
+  assert.equal(requests.length, 1);
+  switchTo(c);
+  assert.equal(button().textContent, '下载已校验的 Preview_C.glb');
+  assert.equal(button().disabled, false);
+  await button().onclick();
+  switchTo(b);
+  const active = button();
+  pending.resolve();
+  await first;
+  assert.equal(button(), active);
+  assert(active.disabled);
+  assert.deepEqual(requests, [a, c].map(variant => ({
+    declaration: variant.modelAsset, resourceBaseUrl: variant.resourceBaseUrl
+  })));
+  assert.deepEqual(h.downloads.map(download => download.name), ['Preview_C.glb', 'Preview A.glb']);
+  assert.deepEqual(await Promise.all(h.downloads.map(download => download.blob.text())), [c.modelAsset.preview_sha256, a.modelAsset.preview_sha256]);
+  assert.equal(container.innerHTML, sourceLinks);
+  assert(container.children.includes(partner));
+  assert.equal(h.get('#comment').value, 'Keep this draft');
+  assert(h.app.selected.has(item.id));
+
+  pending = deferred();
+  switchTo(a);
+  const failed = button().onclick();
+  switchTo(c);
+  const toast = h.toast();
+  pending.reject(Error('Rejected old model'));
+  await failed;
+  assert.equal(h.toast(), toast);
+  assert.equal(button().textContent, '下载已校验的 Preview_C.glb');
+  assert.equal(button().disabled, false);
+});
 
 test('public detail shows only the active model warnings across compare and view changes', async t => {
   const technical = {

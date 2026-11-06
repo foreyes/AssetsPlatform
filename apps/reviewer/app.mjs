@@ -1142,6 +1142,7 @@ async function openDetail(item) {
     warning.textContent = item.displayWarning;
     $('#assembly-evidence').append(warning);
   }
+  $('.detail-layout').scrollTop = 0;
   $('.detail-info').scrollTop = 0;
   loadObjectHierarchy(item);
   loadItemEvidence(item);
