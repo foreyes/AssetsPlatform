@@ -7,11 +7,11 @@ import { guardStartup } from './shared/startup-state.mjs';
 import { mountPartnerSelections } from './shared/selection-client.mjs';
 let partnerSelections = null,
   legacySelected = [];
-import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentity, downloadResource } from './shared/viewer-adapter.mjs';
+import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentity, describeDownload, downloadResource } from './shared/viewer-adapter.mjs';
 import { createPreviewQueue } from './shared/preview-queue.mjs';
 import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
-import { loadReviewState, saveReviewState } from './shared/selection-state.mjs';
+import { browserStorage, loadReviewState, createReviewWriter } from './shared/selection-state.mjs';
 import { configureShell as mountShell, renderEvidenceSections } from './shared/shell-controller.mjs';
 import { getResourceResolver, mapResourceData, createProjectScope } from './shared/resource-url.mjs';
 const project = await guardStartup(() => loadProject());
@@ -87,6 +87,7 @@ let state = {
   layout: 'grid'
 };
 let projectData,
+  activeLibraryDataset,
   currentVariant = null,
   hierarchyRequest = 0,
   resourceRequest = 0,
@@ -94,6 +95,8 @@ let projectData,
   resourceAbort = null;
 let reviews = Object.create(null),
   selected = new Set(),
+  unavailableSelected = [],
+  isSelectionReady = config.sharedSelections === false,
   storageOK = true,
   current = null,
   filtered = [],
@@ -206,24 +209,52 @@ function showToast(message) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => $('#toast').hidden = true, 4200);
 }
+function showReviewImportResult(message) {
+  const status = $('#audit-modal').open && $('#audit-import-status');
+  if (!status) return showToast(message);
+  status.textContent = message;
+  status.scrollIntoView({ block: 'nearest' });
+}
 function reviewOf(item) {
   return reviews[item.id] || {
     status: 'pending',
     comment: ''
   };
 }
-function persist() {
-  storageOK = saveReviewState(localStorage, config, {
-    reviews,
-    selected,
-    legacySelected
-  });
+let reviewWriter, commentDirty = false, commentBaseline = '';
+function persist(intent) {
+  const expectedSelection = new Set(selected);
+  if (intent.selection?.clear) expectedSelection.clear();
+  for (const id of intent.selection?.add || []) expectedSelection.add(id);
+  for (const id of intent.selection?.remove || []) expectedSelection.delete(id);
+  const previousRows = state.view === 'selected' || state.view === 'reviewed' ? filterItems() : null;
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const saved = reviewWriter.save(intent, {reviews, selected: [...selected, ...unavailableSelected], legacySelected});
+  const known = new Set(itemMap.keys());
+  reviews = sanitizeReviews(saved.reviews, projectData?.kind === 'entity' && !projectData.datasets.adapter ? new Set(Object.keys(saved.reviews)) : known);
+  selected = new Set(saved.selected.filter(id => known.has(id)));
+  unavailableSelected = config.sharedSelections || (projectData?.kind === 'entity' && !projectData.datasets.adapter) ? saved.selected.filter(id => !known.has(id)) : [];
+  legacySelected = saved.legacySelected;
+  storageOK = saved.ok;
   $('#storage-warning').hidden = storageOK;
-  partnerSelections?.changed();
+  const selectionRebased = selected.size !== expectedSelection.size || [...selected].some(id => !expectedSelection.has(id));
+  const currentRows = previousRows && filterItems();
+  if (previousRows && (selectionRebased || state.view === 'reviewed') && (previousRows.length !== currentRows.length || previousRows.some((item, index) => item !== currentRows[index]))) {
+    render();
+  } else if (selectionRebased) {
+    // Keep existing cards (and keyboard focus) when only selection decoration changed.
+    $$('.asset-card').forEach(card => {
+      const checked = selected.has(card.dataset.id);
+      card.querySelector('.card-check').checked = checked;
+      card.classList.toggle('selected', checked);
+    });
+    renderStats();
+  }
+  if (selectionRebased && current) $('#detail-selected').checked = selected.has(current.id);
   return storageOK;
 }
 function loadState() {
-  const saved = loadReviewState(localStorage, config);
+  const saved = loadReviewState(browserStorage, config);
   reviews = saved.reviews;
   selected = new Set(saved.selected);
   legacySelected = saved.legacySelected;
@@ -243,13 +274,18 @@ function normalizeResource(record) {
     notes: Array.isArray(record.notes) ? record.notes : [record.notes].filter(Boolean)
   };
 }
-function normalizeObject(record) {
-  const base = resources.find(a => a.id === record.assetId || a.id === record.prefabId || a.sourceId === record.sourceId) || {};
+function isUsableIdentity(id) {
+  return (typeof id === 'string' && id.trim() !== '') || Number.isFinite(id);
+}
+function normalizeObject(record, basesById, basesBySourceId) {
+  const base = basesById.get(record.assetId) ?? basesById.get(record.prefabId) ?? basesBySourceId.get(record.sourceId) ?? {};
   const merged = {
     ...base,
     ...record
   };
   const rawName = record.name || base.name || record.id;
+  const explicitModelUrl = record.assemblyModelUrl || record.modelUrl || record.materialModelUrl;
+  const usesBaseModel = !explicitModelUrl || (base.modelAsset && base.modelUrl && new URL(explicitModelUrl, config.assetRoot).href === new URL(base.modelUrl, config.assetRoot).href);
   return {
     ...merged,
     id: String(record.id),
@@ -258,7 +294,9 @@ function normalizeObject(record) {
     type: 'object',
     isObject: true,
     category: objectCategory(merged),
-    modelUrl: record.assemblyModelUrl || record.modelUrl || record.materialModelUrl || base.modelUrl,
+    modelUrl: explicitModelUrl || base.modelUrl,
+    modelAsset: record.modelAsset || (usesBaseModel ? base.modelAsset : undefined),
+    variants: record.variants || (explicitModelUrl ? [] : base.variants),
     previewUrl: record.previewUrl || record.thumbnailUrl || base.previewUrl,
     notes: Array.isArray(record.notes) ? record.notes : Array.isArray(base.notes) ? base.notes : [],
     provenance: record.provenance || base.provenance || {},
@@ -390,19 +428,30 @@ async function readJSON(url, required = true, options = {}) {
 }
 async function init() {
   loadState();
+  $('#storage-warning').hidden = storageOK;
   try {
     projectData = await loadProjectData(project, readJSON);
+    const libraryDatasets = Object.keys(projectData.datasets ?? {});
+    const preferredLibraries = [config.defaultFacets?.libraryDataset, config.datasetId, projectData.defaultFilters?.libraryDataset];
+    activeLibraryDataset = preferredLibraries.find(id => libraryDatasets.includes(id)) ?? libraryDatasets[0];
     catalog = projectData.catalog;
     objectCatalog = projectData.objectCatalog;
     if (projectData.profiles) defaultProfiles = projectData.profiles;
     if (projectData.defaultFilters && !config.defaultFacets) state.facets = {
       ...projectData.defaultFilters
     };
-    resources = (catalog.assets || []).map(normalizeResource);
+    const basesById = new Map(),
+      basesBySourceId = new Map();
+    resources = (catalog.assets || []).map(record => {
+      const resource = normalizeResource(record);
+      if (isUsableIdentity(record.id) && !basesById.has(resource.id)) basesById.set(resource.id, resource);
+      if (isUsableIdentity(record.sourceId) && !basesBySourceId.has(record.sourceId)) basesBySourceId.set(record.sourceId, resource);
+      return resource;
+    });
     resourceMap = new Map(resources.map(a => [a.id, a]));
     sourceMap = new Map(resources.filter(a => a.sourceId).map(a => [a.sourceId, a]));
     objects = (objectCatalog.objects || objectCatalog.assets || []).map((record, index) => ({
-      ...normalizeObject(record),
+      ...normalizeObject(record, basesById, basesBySourceId),
       catalogOrder: index
     }));
     if (!objects.length) throw Error('物件目录暂不可用');
@@ -425,7 +474,7 @@ async function init() {
       version: 1,
       flatCanopySourceMaterialIds: []
     };
-    defaultProfile = readDefaultProfile(localStorage, profiles);
+    defaultProfile = readDefaultProfile(browserStorage, profiles);
     profileA = defaultProfile;
     profileB = config.compareProfile || profiles.find(p => p.id !== profileA && p.implemented)?.id || profileA;
     items = [...objects, ...resources];
@@ -442,7 +491,13 @@ async function init() {
       }
     }
     const known = new Set(itemMap.keys());
-    reviews = sanitizeReviews(reviews, known);
+    // A missing optional manifest is not evidence that its saved records were deleted.
+    if (projectData.kind === 'entity' && !projectData.datasets.adapter) {
+      reviews = sanitizeReviews(reviews, new Set(Object.keys(reviews)));
+      unavailableSelected = [...selected].filter(id => !known.has(id));
+    } else {
+      reviews = sanitizeReviews(reviews, known);
+    }
     selected = new Set([...selected].filter(id => known.has(id)));
     configureShell();
     buildProfiles();
@@ -453,25 +508,36 @@ async function init() {
       enabled: config.sharedSelections,
       siteId: config.siteId,
       legacyKey: KEY,
+      localSelectionStorageKey: config.selectionStorageKey,
+      exportLocalDraft: exportReviewBackup,
       items,
-      getSelected: () => selected,
+      getSelected: () => new Set([...selected, ...unavailableSelected]),
       replaceSelected: ids => {
-        selected = new Set(ids);
+        selected = new Set(ids.filter(id => itemMap.has(id)));
+        unavailableSelected = ids.filter(id => !itemMap.has(id));
+        syncDetailSelection();
         renderNavigation();
         render();
       },
       openItem: item => item.isObject ? openDetail(item) : openResource(item),
       getProfile: () => profileById(defaultProfile)
     });
+    if (!isSelectionReady) {
+      isSelectionReady = true;
+      syncDetailSelection();
+      if (current) partnerSelections.decorateDownloads(current, $('#detail-downloads'));
+      render();
+    }
     if (config.capabilities.research) await buildResearch();
     if (config.capabilities.effects) await buildWeaponEffects();
+    isReviewImportReady = true;
+    $('#import-btn').disabled = $('#mobile-import').disabled = $('#audit-import').disabled = false;
   } catch (error) {
     $('#load-error').hidden = false;
     $('#load-error').textContent = `${error.message}。请刷新重试；已保留当前审阅记录。`;
     $('#result-description').textContent = '物件目录尚未成功载入';
     console.error(error);
   }
-  $('#storage-warning').hidden = storageOK;
 }
 function isObjectView() {
   return state.view === 'objects';
@@ -514,9 +580,17 @@ function renderStats() {
   $('#stat-reviewed-caption').textContent = '当前浏览器的审阅记录';
   $('#selected-count').textContent = selected.size;
   $('#reviewed-count').textContent = reviewed;
-  $('#selection-bar').hidden = !selected.size;
-  $('#selection-number').textContent = selected.size;
+  const unavailableCount = unavailableSelected.length;
+  const selectionCount = selected.size + unavailableCount;
+  $('#selection-bar').hidden = !selectionCount;
+  $('#selection-number').textContent = selectionCount;
+  $('#clear-selection').disabled = !isSelectionReady;
+  const unavailableStatus = $('#selection-unavailable');
+  unavailableStatus.hidden = !unavailableCount;
+  unavailableStatus.textContent = unavailableCount ? `其中 ${unavailableCount} 项暂不可用` : '';
   $('#compare-btn').disabled = selected.size < 2 || selected.size > 4;
+  $('#export-csv').disabled = !selected.size;
+  $('#export-json').disabled = !selected.size;
 }
 function canPlayAnimation(item) {
   const record = animationRecords.get(item.id);
@@ -659,8 +733,11 @@ function render() {
   $$('[data-category]').forEach(button => button.classList.toggle('active', button.dataset.category === state.category));
   $$('.asset-card').forEach(card => {
     const item = itemMap.get(card.dataset.id);
-    card.querySelector('.card-check').onchange = event => {
+    const checkbox = card.querySelector('.card-check');
+    checkbox.disabled = !isSelectionReady;
+    checkbox.onchange = event => {
       toggleSelection(item.id, event.target.checked);
+      event.target.checked = selected.has(item.id);
       if (state.view === 'selected') render();else card.classList.toggle('selected', event.target.checked);
     };
     card.querySelector('.card-preview').onclick = () => openDetail(item);
@@ -702,9 +779,16 @@ function goToPage(requestedPage) {
   });
 }
 function toggleSelection(id, on) {
-  if (on) selected.add(id);else selected.delete(id);
-  persist();
+  if (!isSelectionReady || selected.has(id) === on) return;
+  persist({selection: on ? {add: [id]} : {remove: [id]}});
+  partnerSelections?.changed(on ? {add: [id]} : {remove: [id]});
+  syncDetailSelection();
   renderStats();
+}
+function syncDetailSelection() {
+  const checkbox = $('#detail-selected');
+  checkbox.disabled = !isSelectionReady;
+  checkbox.checked = current !== null && selected.has(current.id);
 }
 function metricHTML(item) {
   let rows;
@@ -942,10 +1026,8 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
   playback.configure([]);
   const item = current;
   if (!item) return;
-  const rendered = currentVariant ? {
-    ...item,
-    ...currentVariant
-  } : item;
+  const rendered = currentVariant || item;
+  $('#retry-preview').hidden = true;
   viewerLoading = true;
   $('#toggle-render-compare').disabled = true;
   const candidateRecord = item.isObject ? selectedAnimationRecord(item) : null;
@@ -987,6 +1069,23 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     }
     if (request !== viewerRequest) return;
   }
+  const onViewerError = error => {
+    if (request !== viewerRequest || abort.signal.aborted || error?.code !== 'WEBGL_CONTEXT_LOST') return;
+    pausePlayback();
+    $('#preview-caption').textContent = error.message;
+    $('#animation-controls').hidden = true;
+    $('#wireframe-btn').hidden = true;
+    $('#reset-camera').hidden = true;
+    offerPreviewRetry();
+  };
+  const offerPreviewRetry = () => {
+    const retry = $('#retry-preview');
+    retry.hidden = false;
+    retry.onclick = () => {
+      if (request === viewerRequest) startViewers();
+    };
+
+  };
   try {
     const modelUrl = animationRecord?.modelUrl || rendered.modelUrl;
     const a = await createViewer(stageA, modelUrl, {
@@ -997,6 +1096,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
       signal: abort.signal,
       camera: previousCamera,
       animationData,
+      onError: onViewerError,
       onCameraChange: camera => syncCamera(camera, 'a')
     });
     if (request !== viewerRequest) {
@@ -1013,6 +1113,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
         signal: abort.signal,
         camera: a.getCamera?.(),
         animationData,
+        onError: onViewerError,
         onCameraChange: camera => syncCamera(camera, 'b')
       });
       if (request !== viewerRequest) {
@@ -1039,6 +1140,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     stageA.innerHTML = item.originalUrl || item.previewUrl ? imageHTML(item, true) : '';
     stageB.innerHTML = item.originalUrl || item.previewUrl ? imageHTML(item, true) : '';
     showPreviewFailure(stageA, failure);
+    if (error?.code === 'WEBGL_CONTEXT_LOST') offerPreviewRetry();
     if (comparison) showPreviewFailure(stageB, failure);
     $('#wireframe-btn').hidden = true;
     $('#reset-camera').hidden = true;
@@ -1054,7 +1156,7 @@ async function openDetail(item) {
   previewQueue?.cancel();
   if (current) saveComment();
   current = item;
-  currentVariant = (item.variants || []).find(v => v.modelAsset === item.modelAsset) || (item.variants || [])[0] || null;
+  currentVariant = (item.variants || []).find(v => item.modelAsset ? v.modelAsset === item.modelAsset : v.modelUrl === item.modelUrl) || (item.variants || [])[0] || null;
   const variants = $('#resource-variant');
   variants.hidden = !(item.variants || []).length;
   variants.innerHTML = (item.variants || []).map(v => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join('');
@@ -1076,7 +1178,7 @@ async function openDetail(item) {
   const index = filtered.findIndex(a => a.id === item.id);
   $('#detail-index').textContent = index >= 0 ? `${index + 1} / ${filtered.length}` : '';
   $('#detail-tags').innerHTML = `<span>${item.isObject ? esc(config.objectViewLabel || '完整物件') : esc(typeLabels[item.type] || item.type)}</span><span>${esc(categoryLabel(item.category))}</span><span>${esc(previewLabel(item))}</span>`;
-  $('#detail-selected').checked = selected.has(item.id);
+  syncDetailSelection();
   $('#detail-metrics').innerHTML = metricHTML(item);
   $('#detail-provenance').innerHTML = provenanceHTML(item);
   $('#detail-downloads').innerHTML = downloadsHTML(item);
@@ -1089,6 +1191,8 @@ async function openDetail(item) {
     if (related?.isObject) openDetail(related);
   });
   $('#comment').value = reviewOf(item).comment || '';
+  commentBaseline = $('#comment').value;
+  commentDirty = false;
   updateReviewButtons();
   $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
   $('#preview-disclaimer').textContent = item.isObject ? '按原始 renderer → material → texture 引用组合，不靠同名猜配。贴图、透明裁切与支持的材质参数可显示；游戏脚本、风、粒子与原 Unity 光照未重现。动画只在验证通过时提供播放器。' : item.type === 'program' ? '这是反编译重建的 C# 文本，不是原始项目源码。只做静态阅读，未执行原 DLL/EXE。' : item.type === 'animation' ? '这是动画元数据，不提供播放，不虚构与完整物件的绑定。' : item.type === 'material' ? '关联贴图仅用于溯源，不是材质球渲染。请在完整物件里查看材质与几何组合。' : '当前是独立技术资源；独立白模不包含完整原材质组合。项目渲染模式仅用于光照检视，完整效果请回到“完整物件”。';
@@ -1106,10 +1210,11 @@ async function openDetail(item) {
     warning.textContent = item.displayWarning;
     $('#assembly-evidence').append(warning);
   }
+  $('.detail-layout').scrollTop = 0;
   $('.detail-info').scrollTop = 0;
   loadObjectHierarchy(item);
   loadItemEvidence(item);
-  bindResourceDownloads(item, $('#detail-downloads'));
+  updateVerifiedModelDownload(currentVariant || item);
   await startViewers();
 }
 async function openResource(resource) {
@@ -1127,7 +1232,7 @@ async function openResource(resource) {
   $('#resource-title').textContent = resource.name;
   $('#resource-content').innerHTML = (resource.previewUrl ? imageHTML(resource, true) : '') + `<div class="detail-metrics">${metricHTML(resource)}</div><p class="resource-note">${esc(previewLabel(resource))}。${esc(resource.notes?.join('；') || '')}</p><dl>${provenanceHTML(resource)}</dl><div class="detail-downloads">${downloadsHTML(resource)}</div>`;
   $('#resource-modal').showModal();
-  bindResourceDownloads(resource, $('#resource-content'));
+  updateVerifiedModelDownload(resource, $('#resource-content'));
   if (resource.metadataUrl) {
     try {
       const metadata = await readJSON(resource.metadataUrl, true, {
@@ -1202,18 +1307,12 @@ function updateReviewButtons() {
 }
 function saveComment() {
   clearTimeout(commentTimer);
-  if (!current) return;
-  const comment = $('#comment').value,
-    old = reviewOf(current);
-  if (comment !== old.comment) {
-    reviews[current.id] = {
-      ...old,
-      comment,
-      updatedAt: new Date().toISOString()
-    };
-    persist();
-    $('#save-status').textContent = storageOK ? '✓ 已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
-  }
+  if (!current || !commentDirty) return;
+  commentDirty = false;
+  if ($('#comment').value === commentBaseline) return;
+  commentBaseline = $('#comment').value;
+  persist({patch: {id: current.id, comment: commentBaseline, updatedAt: new Date().toISOString()}});
+  $('#save-status').textContent = storageOK ? '✓ 已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
 }
 function closeDetail() {
   hierarchyAbort?.abort();
@@ -1248,6 +1347,7 @@ function resetFilters() {
     },
     page: 1
   };
+  if (state.view === 'technical' && activeLibraryDataset) state.facets.libraryDataset = activeLibraryDataset;
   if (config.capabilities.animationFilters) $('#animation-filter').value = 'all';
   $('#search').value = '';
   $('#category-filter').value = 'all';
@@ -1279,6 +1379,30 @@ function download(name, content, type) {
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+function exportReviewBackup() {
+  if (!isReviewImportReady) return false;
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const intent = current && commentDirty && $('#comment').value !== commentBaseline ? {patch: {id: current.id, comment: $('#comment').value}} : {};
+  const accountSnapshot = partnerSelections?.authenticated ? partnerSelections.snapshotSelection() : null;
+  const snapshot = reviewWriter.snapshot({reviews, selected: accountSnapshot?.selected ?? [...selected, ...unavailableSelected], legacySelected,
+    accountSelection: partnerSelections?.authenticated === true}, intent);
+  snapshot.ok &&= accountSnapshot?.ok ?? true;
+  const payload = {
+    ...reviewBackupIdentity(config), exportedAt: new Date().toISOString(), scope: 'full-catalogue',
+    selected: snapshot.selected, reviews: snapshot.reviews,
+    warnings: snapshot.ok ? [] : ['存储不可用、缺失或损坏，无法确认其他标签页的最新更改；已保留当前可读取与未保存的状态。'],
+    notice: '仅备份选择与审阅，不恢复账号或昵称，不是交付 manifest。目录中暂不可用的 ID 会保留在文件中，须待目录恢复后再导入。'
+  };
+  const blob = new Blob([JSON.stringify(payload)], {type: 'application/json'});
+  if (blob.size > config.importLimitMiB * 1024 * 1024) {
+    alert(`选择与审阅备份超过 ${config.importLimitMiB} MiB 导入上限，未导出可恢复备份。请保留当前页面，不要刷新或关闭。`);
+    showToast('备份超过导入上限，未导出；请保留当前页面');
+    return false;
+  }
+  download(`${config.exportPrefix}_ReviewBackup_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
+  showToast(snapshot.ok ? '选择与审阅备份已导出；暂不可用的 ID 须待目录恢复后再导入' : '已导出可读取与未保存的状态；无法确认其他标签页的最新更改');
+  return true;
+}
 function exportJSON(all = false) {
   const subset = all ? items : items.filter(a => selected.has(a.id));
   const payload = {
@@ -1288,7 +1412,7 @@ function exportJSON(all = false) {
     objectCatalogVersion: objectCatalog.version,
     scope: all ? 'full-catalogue' : 'selected',
     notice: '包含目录索引、选择和审阅记录，可导入恢复审阅；不包含模型字节、完整依赖或原工程备份。个人审阅记录来自当前浏览器，不自动同步。',
-    selected: [...selected],
+    selected: all ? [...selected, ...unavailableSelected] : [...selected],
     reviews: Object.fromEntries(Object.entries(reviews).filter(([id]) => all || selected.has(id))),
     ...(config.compactExports ? {
       animationPreviewRecords: [...animationRecords.values()],
@@ -1334,10 +1458,18 @@ function buildAudit() {
   button.onclick = () => exportJSON(true);
   content.append(button);
   const load = document.createElement('button');
+  load.id = 'audit-import';
   load.className = 'light-btn';
   load.textContent = '导入审阅记录';
-  load.onclick = () => $('#import-file').click();
-  content.append(load);
+  load.disabled = !isReviewImportReady;
+  const importStatus = document.createElement('div');
+  importStatus.id = 'audit-import-status';
+  importStatus.setAttribute('role', 'status');
+  load.onclick = () => {
+    importStatus.textContent = '';
+    $('#import-file').click();
+  };
+  content.append(load, importStatus);
 }
 function compareSelected() {
   const list = items.filter(a => selected.has(a.id));
@@ -1397,8 +1529,11 @@ $$('[data-bg]').forEach(button => button.onclick = () => {
   $('#preview-stage-b').className = 'preview-stage ' + state.bg;
 });
 $('#clear-selection').onclick = () => {
-  selected.clear();
-  persist();
+  if (!isSelectionReady || (!selected.size && !unavailableSelected.length)) return;
+  const hadDraftSelection = selected.size > 0 || unavailableSelected.length > 0;
+  persist({selection: {clear: true}});
+  if (hadDraftSelection) partnerSelections?.changed({clear: true});
+  syncDetailSelection();
   render();
 };
 $('#compare-btn').onclick = compareSelected;
@@ -1411,11 +1546,14 @@ $('#import-btn').onclick = () => $('#import-file').click();
 $('#mobile-import').onclick = () => $('#import-file').click();
 $('#mobile-audit').onclick = () => $('#audit-modal').showModal();
 $('#resource-variant').onchange = event => {
-  currentVariant = (current?.variants || []).find(v => v.id === event.target.value) || null;
+  if (!current) return;
+  currentVariant = (current.variants || []).find(v => v.id === event.target.value) || null;
+  updateVerifiedModelDownload(currentVariant || current);
   startViewers(false, false);
 };
 $('#detail-selected').onchange = event => {
   if (current) toggleSelection(current.id, event.target.checked);
+  syncDetailSelection();
 };
 $$('.close-modal').forEach(button => button.onclick = () => button.closest('dialog').close());
 $('#detail-modal').addEventListener('close', closeDetail);
@@ -1429,17 +1567,13 @@ $('#compare-modal').addEventListener('close', () => {
 $$('.review-buttons button').forEach(button => button.onclick = () => {
   if (!current) return;
   saveComment();
-  reviews[current.id] = {
-    ...reviewOf(current),
-    status: button.dataset.status,
-    updatedAt: new Date().toISOString()
-  };
-  persist();
+  persist({patch: {id: current.id, status: button.dataset.status, updatedAt: new Date().toISOString()}});
   updateReviewButtons();
   renderStats();
   $('#save-status').textContent = storageOK ? '✓ 审阅结论已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
 });
 $('#comment').oninput = () => {
+  commentDirty = true;
   clearTimeout(commentTimer);
   $('#save-status').textContent = '正在保存…';
   commentTimer = setTimeout(saveComment, 350);
@@ -1510,6 +1644,7 @@ document.addEventListener('visibilitychange', () => {
   } else if (!$('#detail-modal').open) scheduleCardPreviews();
 });
 window.addEventListener('pagehide', () => {
+  invalidateReviewImport();
   resourceScope.invalidate();
   resourceAbort?.abort();
   hierarchyAbort?.abort();
@@ -1538,34 +1673,62 @@ window.addEventListener('pageshow', event => {
     if (current && $('#detail-modal').open) startViewers(false, false);else scheduleCardPreviews();
   }
 });
+let reviewImportGeneration = 0;
+let isReviewImportReady = false;
+function invalidateReviewImport() {
+  ++reviewImportGeneration;
+  $('#import-file').value = '';
+}
 $('#import-file').onchange = async event => {
+  const generation = ++reviewImportGeneration;
+  const { projectId, datasetId, reviewKey } = config;
+  const isCurrentImport = () => generation === reviewImportGeneration && projectId === config.projectId &&
+    datasetId === config.datasetId && reviewKey === config.reviewKey;
   const file = event.target.files[0];
   if (!file) return;
   try {
+    if (!isReviewImportReady) throw Error('资产目录尚未载入');
     if (file.size > config.importLimitMiB * 1024 * 1024) throw Error(`文件超过 ${config.importLimitMiB} MB，请使用本站导出的审阅 JSON`);
+    const text = await file.text();
+    if (!isReviewImportReady || !isCurrentImport()) return;
     const imported = importReviewBackup({
-      text: await file.text(),
+      text,
       knownIds: new Set(itemMap.keys()),
       parse: parseReviewImport,
       config,
       confirmLegacy: message => window.confirm(message)
     });
-    if (!imported) {
-      event.target.value = '';
-      return;
+    if (!imported) return;
+    const previousSelectionSize = selected.size;
+    const isSaved = persist({reviews: imported.reviews, selection: {add: imported.selected}});
+    const hasDraftChanges = config.sharedSelections && selected.size !== previousSelectionSize;
+    const isDraftSaved = !config.sharedSelections || !imported.selected.length ||
+      (hasDraftChanges ? partnerSelections.changed({add: imported.selected}) : partnerSelections.saveSelection({add: imported.selected}));
+    if (current) {
+      if (Object.hasOwn(imported.reviews, current.id)) {
+        clearTimeout(commentTimer);
+        $('#comment').value = reviewOf(current).comment;
+        commentBaseline = $('#comment').value;
+        commentDirty = false;
+        updateReviewButtons();
+        $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
+      }
+      syncDetailSelection();
     }
-    Object.assign(reviews, imported.reviews);
-    imported.selected.forEach(id => selected.add(id));
-    persist();
     render();
-    showToast(`已合并 ${Object.keys(imported.reviews).length} 条有效记录，忽略未知 ID；同一资产采用导入记录。`);
+    const count = Object.keys(imported.reviews).length;
+    const result = isSaved && isDraftSaved
+      ? `已合并 ${count} 条有效记录并保存到当前浏览器。`
+      : `已在当前页面合并 ${count} 条有效记录，浏览器未能完整保存。请在刷新或离开前导出备份。`;
+    showReviewImportResult(hasDraftChanges ? result + '新增选择尚未发布。' : result);
   } catch (error) {
-    showToast('导入失败：' + error.message);
+    if (isCurrentImport()) showReviewImportResult('导入失败：' + error.message);
+  } finally {
+    if (isCurrentImport()) event.target.value = '';
   }
-  event.target.value = '';
 };
 function setDefaultPreview(value) {
-  const result = writeDefaultProfile(localStorage, value, profiles);
+  const result = writeDefaultProfile(browserStorage, value, profiles);
   defaultProfile = result.profileId;
   $('#default-profile').value = defaultProfile;
   $('#default-profile-note').textContent = result.saved ? '已记住此浏览器默认 · 卡片与详情视图 A 同步使用' : '本次已应用，但浏览器无法保存；刷新后会恢复默认';
@@ -1672,7 +1835,7 @@ function invalidatePreviews() {
   if (!document.hidden && !$('#detail-modal').open) queueMicrotask(scheduleCardPreviews);
 }
 function activeResources() {
-  return projectData?.datasets?.[config.datasetId]?.resources?.map(raw => itemMap.get(raw.id) || raw) || resources;
+  return projectData?.datasets?.[activeLibraryDataset]?.resources?.map(raw => itemMap.get(raw.id) || raw) || resources;
 }
 function renderDynamicFacets() {
   const host = $('#facet-filters');
@@ -1690,7 +1853,7 @@ function renderDynamicFacets() {
     }[key];
     const control = document.createElement('select');
     control.dataset.facet = key;
-    const options = key === 'librarySource' ? (projectData.datasets?.[config.datasetId]?.sources || []).map(s => ({
+    const options = key === 'librarySource' ? (projectData.datasets?.[activeLibraryDataset]?.sources || []).map(s => ({
       value: s.id,
       label: s.label || s.id
     })) : projectData.filterOptions[key] || [];
@@ -1755,6 +1918,7 @@ function configureShell() {
     },
     onDataset: changeDataset,
     onProjectLeave: () => {
+      invalidateReviewImport();
       resourceScope.invalidate();
       resourceAbort?.abort();
       hierarchyAbort?.abort();
@@ -1781,11 +1945,12 @@ function configureShell() {
       option.textContent = dataset.label;
       select.append(option);
     }
-    select.value = config.datasetId;
+    select.value = activeLibraryDataset;
   }
 }
 function changeDataset(id) {
-  if (!projectData.datasets?.[id] || id === config.datasetId) return;
+  if (!projectData.datasets?.[id] || id === activeLibraryDataset) return;
+  invalidateReviewImport();
   resourceScope.invalidate();
   resourceAbort?.abort();
   hierarchyAbort?.abort();
@@ -1803,7 +1968,7 @@ function changeDataset(id) {
   thumbnailObserver?.disconnect();
   thumbnailEpoch++;
   if ($('#detail-modal').open) $('#detail-modal').close();
-  config.datasetId = id;
+  activeLibraryDataset = id;
   for (const key of ['source', 'type', 'librarySource']) state.facets[key] = 'all';
   state.facets.libraryDataset = id;
   state.view = 'technical';
@@ -1830,38 +1995,41 @@ async function loadItemEvidence(item) {
     container.textContent = '资源详情读取失败；原始目录与下载链接仍保留，请重新打开重试。';
   }
 }
-function bindResourceDownloads(item, container) {
-  if (!item.modelAsset || !['glb', 'gltf'].includes(item.modelAsset.format)) return;
-  const button = document.createElement('button');
-  button.className = 'light-btn';
-  button.textContent = '下载已校验的 ' + (item.modelAsset.format || '模型').toUpperCase();
-  if (item.modelAsset.format === 'gltf') {
-    button.disabled = true;
-    button.textContent = '闭合 glTF · 需保留完整依赖目录';
-    button.title = '此处不提供不完整的单文件下载；来源与依赖证据保留。';
+function updateVerifiedModelDownload(resource, container = $('#detail-downloads')) {
+  const previous = container.querySelector('[data-verified-model-download]');
+  const {modelAsset, resourceBaseUrl} = resource;
+  const target = describeDownload(modelAsset);
+  if (!target) {
+    previous?.remove();
+    return;
   }
+  const button = document.createElement('button');
+  button.dataset.verifiedModelDownload = '';
+  button.className = 'light-btn';
+  button.disabled = !target.supported;
+  button.textContent = target.supported ? '下载已校验的 ' + target.filename : target.label;
+  button.title = target.reason || target.filename;
   button.onclick = async () => {
     if (button.disabled) return;
     button.disabled = true;
     try {
-      const result = await downloadResource(item, {
-        resourceBaseUrl: item.resourceBaseUrl
-      });
+      const result = await downloadResource(modelAsset, {resourceBaseUrl});
       if (!result || result.supported === false) throw Error(result?.reason || '此格式未提供已验证下载');
       const url = URL.createObjectURL(result.blob || new Blob([result.bytes], {
           type: result.type || 'application/octet-stream'
         })),
         link = document.createElement('a');
       link.href = url;
-      link.download = result.filename || item.name;
+      link.download = result.filename || target.filename;
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
-      showToast('下载未完成：' + error.message);
+      if (button.isConnected && button.closest('dialog')?.open) showToast('下载未完成：' + error.message);
     } finally {
       button.disabled = false;
     }
   };
-  container.append(button);
+  if (previous) previous.replaceWith(button);
+  else container.append(button);
 }
 init();

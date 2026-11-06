@@ -9,7 +9,31 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const app = path.join(root, 'apps/reviewer');
 export const IMPORT_LIMITS = Object.freeze({models:512, entries:10000, depth:32, totalBytes:256*1024*1024});
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-const within = (child, parent) => child === parent || child.startsWith(parent + path.sep);
+const overlapMessage = 'Output must be outside source and platform repository';
+function within(child, parent) {
+  let current = child;
+  while (current !== parent) {
+    const ancestor = path.dirname(current);
+    if (ancestor === current) return false;
+    current = ancestor;
+  }
+  return true;
+}
+function rejectOverlap(source, output, repository) {
+  if (within(output, repository) || within(output, source) || within(source, output)) {
+    throw Error(overlapMessage);
+  }
+}
+function hasWindowsAncestor(child, parent, canonicalParent) {
+  const foldedParent = parent.toLowerCase();
+  let current = child;
+  while (current.toLowerCase() !== foldedParent) {
+    const ancestor = path.dirname(current);
+    if (ancestor === current) return false;
+    current = ancestor;
+  }
+  return fs.realpathSync.native(current) === canonicalParent;
+}
 function noLinks(target) {
   let current = path.parse(target).root;
   for (const segment of target.slice(current.length).split(path.sep).filter(Boolean)) {
@@ -32,9 +56,20 @@ export function importDirectory({source, output, id, label=id}) {
   if (!source || !output || !/^[a-z][a-z0-9-]{0,63}$/.test(id || '')) throw Error('Required: --source folder --output NEW-folder --id lowercase-project-id');
   if (typeof label !== 'string' || !label.trim() || label.length>160) throw Error('Label must contain 1–160 characters');
   source=path.resolve(source); output=path.resolve(output);
-  noLinks(source); noLinks(path.dirname(output));
+  const outputParent = path.dirname(output);
+  noLinks(source); noLinks(outputParent);
   if (!fs.statSync(source).isDirectory()) throw Error('Source must be a directory');
-  if (within(output,root) || within(output,source) || within(source,output)) throw Error('Output must be outside source and platform repository');
+  // A mounted volume can move realpath outside a lexically protected tree.
+  rejectOverlap(source, output, root);
+  // Canonical names catch aliases without folding distinct case-sensitive siblings.
+  const canonicalSource = fs.realpathSync.native(source);
+  const canonicalRoot = fs.realpathSync.native(root);
+  const canonicalOutput = path.join(fs.realpathSync.native(outputParent), path.basename(output));
+  rejectOverlap(canonicalSource, canonicalOutput, canonicalRoot);
+  // Verify the identity of a case-aliased ancestor before a mount can hide it.
+  if (process.platform === 'win32' &&
+      (hasWindowsAncestor(outputParent, source, canonicalSource) ||
+       hasWindowsAncestor(outputParent, root, canonicalRoot))) throw Error(overlapMessage);
   if (fs.existsSync(output)) throw Error('Output already exists; nothing overwritten');
   const files=[]; let entries=0, totalBytes=0;
   function scan(dir, depth=0) {
@@ -98,7 +133,7 @@ export function importDirectory({source, output, id, label=id}) {
     for (const f of files) fs.writeFileSync(path.join(output,'library/assets',f.key+'.glb'),f.bytes,{flag:'wx'});
     const report={schema:'asset-review-local-import/1',projectId:id,datasetId,models:files.length,totalBytes,gpu:'not-verified',animations:'not-enabled',files:files.map(({bytes,...f})=>f)};
     json(path.join(output,'import-report.json'),report);
-    fs.writeFileSync(path.join(output,'README.txt'),'Local AssetsPlatform workspace\n\nValidate: node validate-workspace.mjs\nRun: node server.mjs (or python3 serve.py)\nOpen: http://127.0.0.1:8768/\nNo installation or account required. Keep this folder private.\nReview state is stored in this browser, not this folder: use Export catalog for a complete JSON review backup before clearing browser data. JSON backups do not contain models.\nDo not edit dataset IDs to bypass review isolation. Reimporting changed content creates a new dataset identity.\nCPU parsing passed; GPU/material appearance, animation, and asset redistribution rights are not verified. See import-report.json for per-model warnings and relative source names.\n',{flag:'wx'});
+    fs.writeFileSync(path.join(output,'README.txt'),'Local AssetsPlatform workspace\n\nValidate: node validate-workspace.mjs\nRun: node server.mjs (or python3 serve.py)\nOpen: http://127.0.0.1:8768/\nNo installation or account required. Keep this folder private.\nReview state is stored in this browser, not this folder: use 导出完整审阅快照 (Export full review snapshot) before clearing browser data. The UTF-8 snapshot must fit the import limit; an oversized catalogue report cannot restore reviews. If the snapshot exceeds the limit, keep browser state and seek maintainer assistance. JSON backups do not contain models.\nDo not edit dataset IDs to bypass review isolation. Reimporting changed content creates a new dataset identity.\nCPU parsing passed; GPU/material appearance, animation, and asset redistribution rights are not verified. See import-report.json for per-model warnings and relative source names.\n',{flag:'wx'});
     return {output,projectId:id,datasetId,models:files.length,totalBytes,warnings:files.flatMap(f=>f.warnings.map(w=>`${f.relative}: ${w}`))};
   } catch (error) { fs.rmSync(output,{recursive:true,force:true}); throw error; }
 }

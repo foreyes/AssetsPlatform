@@ -4,7 +4,7 @@
 
 ## 目录登记与身份
 
-根 `project-directory.json` 包含 schema、defaultProject 与 projects。每个项目至少有唯一 id、label、config、assetRoot。config 为同源配置路径；assetRoot 相对配置文件解析，不能跨入其他已登记项目的资源根。
+根 `project-directory.json` 包含 schema、defaultProject 与 projects。每个项目至少有唯一 id、label、config、assetRoot。config 为同源配置路径；assetRoot 相对配置文件解析；嵌套资源根按最具体的登记根归属，父项目不能读取子根，子项目也不能直接读取父级或兄弟项目的资源。
 
 ```json
 {
@@ -44,6 +44,8 @@ my-project/
 - `render-profiles.json`：渲染说明；代码对这一读取允许缺省，但完整模板仍应提供。实际通用参数定义在 `shared/common-render-profiles.mjs`。说明文本不能自动创造不存在的渲染算法。
 
 modelUrl 相对项目资源根，例如 `assets/models/example.glb`。资源 URL 必须经过解析器，不以展示来源链接代替实际可读取模型 URL。来源链接不自动赋予读取/分发权限。
+
+浏览器解析器按 URL 路径单次解码比较归属，保留正常逻辑挂载与同项目绝对地址。存在不同登记根时，路径段含冒号（包括 NTFS 目录流、盘符别名）、末尾点或空格、短文件名别名，以及可能混淆归属的大小写路径会被拒绝；这些规则只用于拒绝歧义，不扩大读取范围。只有单一或相同资源根时，仍允许这些普通文件名。原生资源与补充资源继续使用各自的显式能力声明。此为浏览器 URL 策略，不替代静态服务器的文件系统访问控制。
 
 ## 模型和能力
 
@@ -91,3 +93,5 @@ v2 强制核对 projectId/datasetId，拒绝不匹配。旧 v1 必须明确确�
 模型单次下载 64 MiB、JSON chunk 8 MiB、accessor 合计 8M 数值、实例顶点 1M、展开索引 3M、图片编码合计 32 MiB、图片像素合计 32M，单边最大 8192。具体值以 `apps/reviewer/viewer.mjs` 的 PREVIEW_LIMITS 为准。
 
 目录 JSON 默认单次原始 64 MiB/解码 128 MiB、页面会话累计各 512 MiB；配置只能在硬上限内调整。项目描述单个 2 MiB/累计 16 MiB，项目最多 128；分片默认最多 256、并发 4（硬上限分别 1024/8）。这限制输入而非保证浏览器总堆峰值。模型、描述和目录请求都禁止重定向。
+
+完整审阅快照使用现有同身份 v2 `scope: full-catalogue`，只携带审阅和选择，不要求资产索引或侧表；目录报告和所选导出字段保持兼容。实际 UTF-8 Blob 超过导入上限的快照不能承诺可恢复，也不拆分或提高上限。

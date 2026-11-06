@@ -1,7 +1,7 @@
 import { createJSONBudget, readBoundedJSON } from './shared/json-budget.mjs';
 import { importReviewBackup, canRestoreReviewSnapshot, restoreReviewSnapshot } from './shared/review-import.mjs';
 import { commonIndexedProfiles } from './shared/common-render-profiles.mjs';
-import { exportAssetIndex, reviewBackupIdentity } from './shared/review-export.mjs';
+import { exportAssetIndex, reviewBackupIdentity, reviewExportBlob, reviewSnapshotBlob, reviewStateSnapshot } from './shared/review-export.mjs';
 import { describePreviewFailure, showPreviewFailure } from './shared/preview-failure-5e4d0bcf88f3.mjs';
 import { guardStartup } from './shared/startup-state.mjs';
 import { mountPartnerSelections } from './shared/selection-client.mjs';
@@ -11,7 +11,7 @@ import { createViewer, createThumbnailRenderer, configureRenderer, renderIdentit
 import { createPreviewQueue } from './shared/preview-queue.mjs';
 import { createWorkbench, createWorkbenchState } from './shared/workbench.mjs';
 import { loadProject, loadProjectData, objectCategory, assetURL } from './shared/project-loader.mjs';
-import { loadReviewState, saveReviewState } from './shared/selection-state.mjs';
+import { browserStorage, loadReviewState, createReviewWriter } from './shared/selection-state.mjs';
 import { configureShell as mountShell, renderEvidenceSections } from './shared/shell-controller.mjs';
 import { getResourceResolver, mapResourceData, createProjectScope } from './shared/resource-url.mjs';
 const project = await guardStartup(() => loadProject());
@@ -206,24 +206,52 @@ function showToast(message) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => $('#toast').hidden = true, 4200);
 }
+function showReviewImportResult(message) {
+  const status = $('#audit-modal').open && $('#audit-import-status');
+  if (!status) return showToast(message);
+  status.textContent = message;
+  status.scrollIntoView({ block: 'nearest' });
+}
 function reviewOf(item) {
   return reviews[item.id] || {
     status: 'pending',
     comment: ''
   };
 }
-function persist() {
-  storageOK = saveReviewState(localStorage, config, {
-    reviews,
-    selected,
-    legacySelected
-  });
+let reviewWriter, commentDirty = false, commentBaseline = '';
+function persist(intent) {
+  const expectedSelection = new Set(selected);
+  if (intent.selection?.clear) expectedSelection.clear();
+  for (const id of intent.selection?.add || []) expectedSelection.add(id);
+  for (const id of intent.selection?.remove || []) expectedSelection.delete(id);
+  const previousRows = state.view === 'selected' || state.view === 'reviewed' ? filterItems() : null;
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const saved = reviewWriter.save(intent, {reviews, selected, legacySelected});
+  const known = new Set(itemMap.keys());
+  reviews = sanitizeReviews(saved.reviews, known);
+  selected = new Set(saved.selected.filter(id => known.has(id)));
+  legacySelected = saved.legacySelected;
+  storageOK = saved.ok;
   $('#storage-warning').hidden = storageOK;
+  const selectionRebased = selected.size !== expectedSelection.size || [...selected].some(id => !expectedSelection.has(id));
+  const currentRows = previousRows && filterItems();
+  if (previousRows && (selectionRebased || state.view === 'reviewed') && (previousRows.length !== currentRows.length || previousRows.some((item, index) => item !== currentRows[index]))) {
+    render();
+  } else if (selectionRebased) {
+    // Keep existing cards (and keyboard focus) when only selection decoration changed.
+    $$('.asset-card').forEach(card => {
+      const checked = selected.has(card.dataset.id);
+      card.querySelector('.card-check').checked = checked;
+      card.classList.toggle('selected', checked);
+    });
+    renderStats();
+  }
+  if (selectionRebased && current) $('#detail-selected').checked = selected.has(current.id);
   partnerSelections?.changed();
   return storageOK;
 }
 function loadState() {
-  const saved = loadReviewState(localStorage, config);
+  const saved = loadReviewState(browserStorage, config);
   reviews = saved.reviews;
   selected = new Set(saved.selected);
   legacySelected = saved.legacySelected;
@@ -243,8 +271,11 @@ function normalizeResource(record) {
     notes: Array.isArray(record.notes) ? record.notes : [record.notes].filter(Boolean)
   };
 }
-function normalizeObject(record) {
-  const base = resources.find(a => a.id === record.assetId || a.id === record.prefabId || a.sourceId === record.sourceId) || {};
+function isUsableIdentity(id) {
+  return (typeof id === 'string' && id.trim() !== '') || Number.isFinite(id);
+}
+function normalizeObject(record, basesById, basesBySourceId) {
+  const base = basesById.get(record.assetId) ?? basesById.get(record.prefabId) ?? basesBySourceId.get(record.sourceId) ?? {};
   const merged = {
     ...base,
     ...record
@@ -259,6 +290,8 @@ function normalizeObject(record) {
     isObject: true,
     category: objectCategory(merged),
     modelUrl: record.assemblyModelUrl || record.modelUrl || record.materialModelUrl || base.modelUrl,
+    modelAsset: record.modelAsset || (record.assemblyModelUrl || record.modelUrl || record.materialModelUrl ? undefined : base.modelAsset),
+    variants: record.variants || (record.assemblyModelUrl || record.modelUrl || record.materialModelUrl ? [] : base.variants),
     previewUrl: record.previewUrl || record.thumbnailUrl || base.previewUrl,
     notes: Array.isArray(record.notes) ? record.notes : Array.isArray(base.notes) ? base.notes : [],
     provenance: record.provenance || base.provenance || {},
@@ -398,11 +431,18 @@ async function init() {
     if (projectData.defaultFilters && !config.defaultFacets) state.facets = {
       ...projectData.defaultFilters
     };
-    resources = (catalog.assets || []).map(normalizeResource);
+    const basesById = new Map(),
+      basesBySourceId = new Map();
+    resources = (catalog.assets || []).map(record => {
+      const resource = normalizeResource(record);
+      if (isUsableIdentity(record.id) && !basesById.has(resource.id)) basesById.set(resource.id, resource);
+      if (isUsableIdentity(record.sourceId) && !basesBySourceId.has(record.sourceId)) basesBySourceId.set(record.sourceId, resource);
+      return resource;
+    });
     resourceMap = new Map(resources.map(a => [a.id, a]));
     sourceMap = new Map(resources.filter(a => a.sourceId).map(a => [a.sourceId, a]));
     objects = (objectCatalog.objects || objectCatalog.assets || []).map((record, index) => ({
-      ...normalizeObject(record),
+      ...normalizeObject(record, basesById, basesBySourceId),
       catalogOrder: index
     }));
     if (!objects.length) throw Error('物件目录暂不可用');
@@ -425,7 +465,7 @@ async function init() {
       version: 1,
       flatCanopySourceMaterialIds: []
     };
-    defaultProfile = readDefaultProfile(localStorage, profiles);
+    defaultProfile = readDefaultProfile(browserStorage, profiles);
     profileA = defaultProfile;
     profileB = config.compareProfile || profiles.find(p => p.id !== profileA && p.implemented)?.id || profileA;
     items = [...objects, ...resources];
@@ -465,6 +505,8 @@ async function init() {
     });
     if (config.capabilities.research) await buildResearch();
     if (config.capabilities.effects) await buildWeaponEffects();
+    isReviewImportReady = true;
+    $('#import-btn').disabled = $('#mobile-import').disabled = $('#audit-import').disabled = false;
   } catch (error) {
     $('#load-error').hidden = false;
     $('#load-error').textContent = `${error.message}。请刷新重试；已保留当前审阅记录。`;
@@ -702,8 +744,7 @@ function goToPage(requestedPage) {
   });
 }
 function toggleSelection(id, on) {
-  if (on) selected.add(id);else selected.delete(id);
-  persist();
+  persist({selection: on ? {add: [id]} : {remove: [id]}});
   renderStats();
 }
 function metricHTML(item) {
@@ -802,7 +843,7 @@ function applyAnimationFrame(state) {
   try {
     for (const viewer of [viewerA, viewerB]) {
       if (!viewer) continue;
-      if (state.clipId) viewer.setAnimationTime?.(state.clipId, state.time);else viewer.resetAnimation?.();
+      if (state.clipId) viewer.setAnimationTime?.(state.clipId, state.time, {reframe: state.reason === 'seek'});else viewer.resetAnimation?.();
     }
   } catch (error) {
     pausePlayback();
@@ -923,6 +964,27 @@ function selectPlayableClip(id, autoplay = false) {
     preventScroll: true
   });
 }
+function showModelWarnings(...viewers) {
+  const maxVisible = 5;
+  const maxLength = 240;
+  const warnings = new Set();
+  for (const viewer of viewers) {
+    for (const warning of viewer?.warnings || []) {
+      if (warning.trim()) warnings.add(warning);
+    }
+  }
+  const entries = [...warnings].slice(0, maxVisible).map(warning => {
+    const entry = document.createElement('li');
+    entry.textContent = warning.length > maxLength ? warning.slice(0, maxLength - 1) + '…' : warning;
+    return entry;
+  });
+  const omitted = warnings.size - entries.length;
+  const extra = $('#model-warnings-extra');
+  $('#model-warnings-list').replaceChildren(...entries);
+  extra.textContent = omitted ? `另有 ${omitted} 条预览限制未显示` : '';
+  extra.hidden = !omitted;
+  $('#model-warnings').hidden = !entries.length;
+}
 async function startViewers(preserveCamera = false, preservePlayback = true) {
   const previousCamera = preserveCamera ? viewerA?.getCamera?.() : undefined,
     preserved = preserveCamera && preservePlayback ? {
@@ -939,6 +1001,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
   viewerB?.dispose();
   viewerA = null;
   viewerB = null;
+  showModelWarnings();
   playback.configure([]);
   const item = current;
   if (!item) return;
@@ -1024,8 +1087,10 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     bindAnimationControls(item, animationRecord, preserved, animationData);
     if (animationClips.length) $('#preview-disclaimer').textContent = '几何、材质与动作来自可验证的源引用。当前模式只播放已验证的原始轨道或离线约束派生结果，不是 Unity 实际运行；未重现游戏脚本、粒子、音效、事件、动态风或完整 Unity Animator。';
     $('#preview-caption').textContent = (currentVariant?.label ? currentVariant.label + ' · ' : '') + (comparison ? '双视图联动机位与动作时间 · 拖动旋转 · 滚轮缩放' : '拖动旋转 · 滚轮缩放' + (config.renderer.compare === false ? '' : ' · 可开启同机位对比'));
+    showModelWarnings(viewerA, viewerB);
   } catch (error) {
     if (request !== viewerRequest) return;
+    showModelWarnings();
     viewerA?.dispose();
     viewerB?.dispose();
     viewerA = null;
@@ -1054,7 +1119,7 @@ async function openDetail(item) {
   previewQueue?.cancel();
   if (current) saveComment();
   current = item;
-  currentVariant = (item.variants || []).find(v => v.modelAsset === item.modelAsset) || (item.variants || [])[0] || null;
+  currentVariant = (item.variants || []).find(v => item.modelAsset ? v.modelAsset === item.modelAsset : v.modelUrl === item.modelUrl) || (item.variants || [])[0] || null;
   const variants = $('#resource-variant');
   variants.hidden = !(item.variants || []).length;
   variants.innerHTML = (item.variants || []).map(v => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join('');
@@ -1089,6 +1154,8 @@ async function openDetail(item) {
     if (related?.isObject) openDetail(related);
   });
   $('#comment').value = reviewOf(item).comment || '';
+  commentBaseline = $('#comment').value;
+  commentDirty = false;
   updateReviewButtons();
   $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
   $('#preview-disclaimer').textContent = item.isObject ? '按原始 renderer → material → texture 引用组合，不靠同名猜配。贴图、透明裁切与支持的材质参数可显示；游戏脚本、风、粒子与原 Unity 光照未重现。动画只在验证通过时提供播放器。' : item.type === 'program' ? '这是反编译重建的 C# 文本，不是原始项目源码。只做静态阅读，未执行原 DLL/EXE。' : item.type === 'animation' ? '这是动画元数据，不提供播放，不虚构与完整物件的绑定。' : item.type === 'material' ? '关联贴图仅用于溯源，不是材质球渲染。请在完整物件里查看材质与几何组合。' : '当前是独立技术资源；独立白模不包含完整原材质组合。项目渲染模式仅用于光照检视，完整效果请回到“完整物件”。';
@@ -1106,6 +1173,7 @@ async function openDetail(item) {
     warning.textContent = item.displayWarning;
     $('#assembly-evidence').append(warning);
   }
+  $('.detail-layout').scrollTop = 0;
   $('.detail-info').scrollTop = 0;
   loadObjectHierarchy(item);
   loadItemEvidence(item);
@@ -1202,18 +1270,12 @@ function updateReviewButtons() {
 }
 function saveComment() {
   clearTimeout(commentTimer);
-  if (!current) return;
-  const comment = $('#comment').value,
-    old = reviewOf(current);
-  if (comment !== old.comment) {
-    reviews[current.id] = {
-      ...old,
-      comment,
-      updatedAt: new Date().toISOString()
-    };
-    persist();
-    $('#save-status').textContent = storageOK ? '✓ 已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
-  }
+  if (!current || !commentDirty) return;
+  commentDirty = false;
+  if ($('#comment').value === commentBaseline) return;
+  commentBaseline = $('#comment').value;
+  persist({patch: {id: current.id, comment: commentBaseline, updatedAt: new Date().toISOString()}});
+  $('#save-status').textContent = storageOK ? '✓ 已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
 }
 function closeDetail() {
   hierarchyAbort?.abort();
@@ -1231,6 +1293,7 @@ function closeDetail() {
   viewerB?.dispose();
   viewerA = null;
   viewerB = null;
+  showModelWarnings();
   current = null;
   render();
 }
@@ -1267,7 +1330,7 @@ function changeView(view) {
   }
 }
 function download(name, content, type) {
-  const blob = new Blob([content], {
+  const blob = content instanceof Blob ? content : new Blob([content], {
       type
     }),
     url = URL.createObjectURL(blob),
@@ -1287,7 +1350,7 @@ function exportJSON(all = false) {
     catalogVersion: catalog.version,
     objectCatalogVersion: objectCatalog.version,
     scope: all ? 'full-catalogue' : 'selected',
-    notice: '包含目录索引、选择和审阅记录，可导入恢复审阅；不包含模型字节、完整依赖或原工程备份。个人审阅记录来自当前浏览器，不自动同步。',
+    notice: '包含目录索引、选择和审阅记录；恢复须符合导入大小限制；不包含模型字节、完整依赖或原工程备份。个人审阅记录来自当前浏览器，不自动同步。',
     selected: [...selected],
     reviews: Object.fromEntries(Object.entries(reviews).filter(([id]) => all || selected.has(id))),
     ...(config.compactExports ? {
@@ -1297,8 +1360,30 @@ function exportJSON(all = false) {
     assetMetadataOnly: true,
     assets: exportAssetIndex(subset)
   };
-  download(`${config.exportPrefix}_${all ? 'Catalogue' : 'Review'}_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json');
-  showToast(all ? '完整目录与审阅记录已导出' : '所选物件与审阅记录已导出');
+  const {blob, restorable} = reviewExportBlob(payload, config);
+  if (!restorable) alert(`目录报告超过 ${config.importLimitMiB} MiB 导入上限，不能用于恢复。请另用“导出完整审阅快照”；若快照也超限，请保留当前浏览器状态。`);
+  download(`${config.exportPrefix}_${all ? 'Catalogue' : 'Review'}_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
+  showToast(restorable ? (all ? '完整目录与审阅记录已导出' : '所选物件与审阅记录已导出') : '目录报告已导出，但超过导入上限，不能恢复');
+}
+function exportReviewSnapshot() {
+  if (!isReviewImportReady) {
+    showToast('资产目录尚未载入，不能导出可恢复快照');
+    return;
+  }
+  reviewWriter ||= createReviewWriter(browserStorage, config);
+  const intent = current && commentDirty && $('#comment').value !== commentBaseline
+    ? {patch: {id: current.id, comment: $('#comment').value, updatedAt: new Date().toISOString()}} : {};
+  const latest = reviewWriter.snapshot({reviews, selected, legacySelected}, intent);
+  const known = new Set(itemMap.keys());
+  const snapshotReviews = sanitizeReviews(latest.reviews, known);
+  const snapshotSelected = latest.selected.filter(id => known.has(id));
+  const {blob, restorable} = reviewSnapshotBlob(reviewStateSnapshot(config, snapshotReviews, snapshotSelected), config);
+  if (!restorable) {
+    alert(`完整审阅快照超过 ${config.importLimitMiB} MiB 导入上限，未导出可恢复备份。请保留当前浏览器状态，不要清理或替换；需要维护者协助处理。`);
+    return;
+  }
+  download(`${config.exportPrefix}_ReviewSnapshot_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
+  showToast(latest.ok ? '完整审阅快照已导出（审阅和选择，不含资产索引或模型）' : '已导出可读取的审阅快照；存储不可用或损坏，无法确认其他标签页的最新更改');
 }
 function exportCSV() {
   const rows = [['ID', 'Name', 'Type', 'Source file', 'Path ID', 'Vertices', 'Triangles', 'Preview mode', 'Review', 'Comment'], ...items.filter(a => selected.has(a.id)).map(a => [a.id, a.name, a.type, a.provenance?.sourceFile, a.provenance?.pathId, a.vertexCount, a.triangleCount, previewLabel(a), REVIEW_STATUSES[reviewOf(a).status], reviewOf(a).comment])];
@@ -1333,10 +1418,23 @@ function buildAudit() {
   button.textContent = '导出目录与审阅记录';
   button.onclick = () => exportJSON(true);
   content.append(button);
+  const snapshot = document.createElement('button');
+  snapshot.className = 'primary-btn';
+  snapshot.textContent = '导出完整审阅快照';
+  snapshot.onclick = exportReviewSnapshot;
+  content.append(snapshot);
   const load = document.createElement('button');
+  load.id = 'audit-import';
   load.className = 'light-btn';
   load.textContent = '导入审阅记录';
-  load.onclick = () => $('#import-file').click();
+  load.disabled = !isReviewImportReady;
+  const importStatus = document.createElement('div');
+  importStatus.id = 'audit-import-status';
+  importStatus.setAttribute('role', 'status');
+  load.onclick = () => {
+    importStatus.textContent = '';
+    $('#import-file').click();
+  };
   content.append(load);
   const restore = document.createElement('button');
   restore.id = 'restore-review-btn';
@@ -1345,7 +1443,7 @@ function buildAudit() {
   restore.disabled = !canRestoreReviewSnapshot(config);
   restore.title = restore.disabled ? '仅支持单存储键的本地审阅' : '替换当前审阅与选择；请先导出完整备份';
   restore.onclick = () => $('#restore-file').click();
-  content.append(restore);
+  content.append(restore, importStatus);
 }
 function compareSelected() {
   const list = items.filter(a => selected.has(a.id));
@@ -1405,13 +1503,13 @@ $$('[data-bg]').forEach(button => button.onclick = () => {
   $('#preview-stage-b').className = 'preview-stage ' + state.bg;
 });
 $('#clear-selection').onclick = () => {
-  selected.clear();
-  persist();
+  persist({selection: {clear: true}});
   render();
 };
 $('#compare-btn').onclick = compareSelected;
 $('#export-csv').onclick = exportCSV;
 $('#export-json').onclick = () => exportJSON(false);
+$('#export-snapshot').onclick = exportReviewSnapshot;
 $('#export-all').onclick = () => exportJSON(true);
 $('#audit-btn').onclick = () => $('#audit-modal').showModal();
 $('#profiles-btn').onclick = () => $('#profiles-modal').showModal();
@@ -1437,17 +1535,13 @@ $('#compare-modal').addEventListener('close', () => {
 $$('.review-buttons button').forEach(button => button.onclick = () => {
   if (!current) return;
   saveComment();
-  reviews[current.id] = {
-    ...reviewOf(current),
-    status: button.dataset.status,
-    updatedAt: new Date().toISOString()
-  };
-  persist();
+  persist({patch: {id: current.id, status: button.dataset.status, updatedAt: new Date().toISOString()}});
   updateReviewButtons();
   renderStats();
   $('#save-status').textContent = storageOK ? '✓ 审阅结论已保存到当前浏览器' : '⚠ 保存失败，请导出备份';
 });
 $('#comment').oninput = () => {
+  commentDirty = true;
   clearTimeout(commentTimer);
   $('#save-status').textContent = '正在保存…';
   commentTimer = setTimeout(saveComment, 350);
@@ -1531,6 +1625,7 @@ window.addEventListener('pagehide', () => {
   viewerA?.dispose();
   viewerB?.dispose();
   viewerA = viewerB = null;
+  showModelWarnings();
 });
 window.addEventListener('pagehide', saveComment);
 window.addEventListener('pagehide', event => {
@@ -1548,15 +1643,17 @@ window.addEventListener('pageshow', event => {
   }
 });
 let restoreGeneration = 0;
+let isReviewImportReady = false;
 $('#import-file').onchange = async event => {
   const generation = ++restoreGeneration;
   const identity = [config.projectId, config.datasetId, config.reviewKey];
   const file = event.target.files[0];
   if (!file) return;
   try {
+    if (!isReviewImportReady) throw Error('资产目录尚未载入');
     if (file.size > config.importLimitMiB * 1024 * 1024) throw Error(`文件超过 ${config.importLimitMiB} MB，请使用本站导出的审阅 JSON`);
     const text = await file.text();
-    if (generation !== restoreGeneration || identity.some((value, index) => value !== [config.projectId, config.datasetId, config.reviewKey][index])) return;
+    if (!isReviewImportReady || generation !== restoreGeneration || identity.some((value, index) => value !== [config.projectId, config.datasetId, config.reviewKey][index])) return;
     const imported = importReviewBackup({
       text,
       knownIds: new Set(itemMap.keys()),
@@ -1564,19 +1661,29 @@ $('#import-file').onchange = async event => {
       config,
       confirmLegacy: message => window.confirm(message)
     });
-    if (!imported) {
-      event.target.value = '';
-      return;
+    if (!imported) return;
+    const isSaved = persist({reviews: imported.reviews, selection: {add: imported.selected}});
+    if (current) {
+      if (Object.hasOwn(imported.reviews, current.id)) {
+        clearTimeout(commentTimer);
+        $('#comment').value = reviewOf(current).comment;
+        commentBaseline = $('#comment').value;
+        commentDirty = false;
+        updateReviewButtons();
+        $('#save-status').textContent = storageOK ? '仅保存在当前浏览器，不会自动跨设备同步' : '存储不可用，请导出备份';
+      }
+      $('#detail-selected').checked = selected.has(current.id);
     }
-    Object.assign(reviews, imported.reviews);
-    imported.selected.forEach(id => selected.add(id));
-    persist();
     render();
-    showToast(`已合并 ${Object.keys(imported.reviews).length} 条有效记录，忽略未知 ID；同一资产采用导入记录。`);
+    const count = Object.keys(imported.reviews).length;
+    showReviewImportResult(isSaved
+      ? `已合并 ${count} 条有效记录并保存到当前浏览器。`
+      : `已在当前页面合并 ${count} 条有效记录，浏览器未能完整保存。请在刷新或离开前导出备份。`);
   } catch (error) {
-    showToast('导入失败：' + error.message);
+    if (generation === restoreGeneration) showReviewImportResult('导入失败：' + error.message);
+  } finally {
+    if (generation === restoreGeneration) event.target.value = '';
   }
-  if (generation === restoreGeneration) event.target.value = '';
 };
 $('#restore-file').onchange = async event => {
   const generation = ++restoreGeneration;
@@ -1590,11 +1697,13 @@ $('#restore-file').onchange = async event => {
     if (generation !== restoreGeneration || identity.some((value, index) => value !== [config.projectId, config.datasetId, config.reviewKey, config.sharedSelections, config.selectionStorageKey][index])) return;
     const snapshot = restoreReviewSnapshot({
       text, knownIds, parse: parseReviewImport,
-      config, storage: localStorage, confirmReplace: message => window.confirm(message)
+      config, storage: browserStorage, confirmReplace: message => window.confirm(message)
     });
     if (!snapshot) return;
     // Persist succeeded; only now replace memory and discard the old comment timer.
     clearTimeout(commentTimer);
+    commentDirty = false;
+    reviewWriter?.reset();
     reviews = snapshot.reviews;
     selected = new Set(snapshot.selected);
     legacySelected = [];
@@ -1602,6 +1711,8 @@ $('#restore-file').onchange = async event => {
     $('#storage-warning').hidden = true;
     if (current) {
       $('#comment').value = reviewOf(current).comment;
+      commentBaseline = $('#comment').value;
+      commentDirty = false;
       $('#detail-selected').checked = selected.has(current.id);
       updateReviewButtons();
       $('#save-status').textContent = '✓ 已恢复到当前浏览器';
@@ -1615,7 +1726,7 @@ $('#restore-file').onchange = async event => {
   }
 };
 function setDefaultPreview(value) {
-  const result = writeDefaultProfile(localStorage, value, profiles);
+  const result = writeDefaultProfile(browserStorage, value, profiles);
   defaultProfile = result.profileId;
   $('#default-profile').value = defaultProfile;
   $('#default-profile-note').textContent = result.saved ? '已记住此浏览器默认 · 卡片与详情视图 A 同步使用' : '本次已应用，但浏览器无法保存；刷新后会恢复默认';

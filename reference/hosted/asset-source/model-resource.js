@@ -96,4 +96,4 @@ export async function loadModelResource(asset,{signal,automatic=false,fetcher,ca
 }
 
 // Only bytes are prepared concurrently. GLTF parsing remains inside the GPU lease.
-export async function prepareModelResource(asset,{signal}={}){if(asset.format!=='gltf')return;const bundle=await loadBundledClosedGLTFBytes(asset,{signal});bundle.buffers.clear();checkAbort(signal);}
+export async function prepareModelResource(asset,{signal,automatic=false}={}){if(automatic){const reason=automaticPreviewReason(asset);if(reason)throw Error(reason);}if(asset.format!=='gltf')return;const bundle=await loadBundledClosedGLTFBytes(asset,{signal});bundle.buffers.clear();checkAbort(signal);}

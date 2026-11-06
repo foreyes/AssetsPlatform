@@ -22,7 +22,7 @@ export function createRendererPool({create,dispose=renderer=>renderer.dispose()}
  }
  function acquire({signal,priority=0}={}){
   if(closed)return Promise.reject(Error('Renderer service is closed'));
-  if(lost)return Promise.reject(Error('WebGL context is lost; wait for restoration'));
+  if(lost)return Promise.reject(Object.assign(Error('WebGL context is lost; wait for restoration'),{code:'WEBGL_CONTEXT_LOST'}));
   try{checkAbort(signal);}catch(error){return Promise.reject(error);}
   return new Promise((resolve,reject)=>{
    const task={signal,priority,sequence:++sequence,resolve,reject,onAbort:null,
@@ -33,7 +33,7 @@ export function createRendererPool({create,dispose=renderer=>renderer.dispose()}
   });
  }
  return {acquire,retryDispose,
-  setLost(value){if(lost===!!value)return;lost=!!value;epoch++;if(lost){active?.abort(Object.assign(Error('WebGL context is lost'),{code:'WEBGL_CONTEXT_LOST'}));for(const task of waiting.splice(0)){task.detach();task.reject(Error('WebGL context is lost'));}}else drain();},
+  setLost(value){if(lost===!!value)return;lost=!!value;epoch++;if(lost){active?.abort(Object.assign(Error('WebGL context is lost'),{code:'WEBGL_CONTEXT_LOST'}));for(const task of waiting.splice(0)){task.detach();task.reject(Object.assign(Error('WebGL context is lost'),{code:'WEBGL_CONTEXT_LOST'}));}}else drain();},
   dispose(){if(!closed){closed=true;active?.abort();for(const task of waiting.splice(0)){task.detach();task.reject(abortError());}}retryDispose();},
   get stats(){return {active:!!active,waiting:waiting.length,contexts:renderer?1:0,lost,epoch,closed};},
  };

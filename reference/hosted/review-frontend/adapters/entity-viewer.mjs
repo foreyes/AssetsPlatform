@@ -145,7 +145,7 @@ export async function createViewer(container, urlOrAsset, options = {}) {
     native = rt.createModelViewer(container, {
       ...(loadModel ? {loadModel} : {}),
       profile: baseProfile,
-      onError(value) { error = value; if (!disposed) options.onError?.(value); },
+      onError(value) { error = value; api.ready = false; if (!disposed) options.onError?.(value); },
       stageFactory(gltf, fullAsset, stageOptions) {
         const result = rt.createRenderStage(gltf, fullAsset, {...stageOptions, controlsFactory(nextCamera, canvas) {
           camera = nextCamera; orbit = new rt.OrbitControls(nextCamera, canvas); return orbit;
@@ -161,7 +161,7 @@ export async function createViewer(container, urlOrAsset, options = {}) {
     });
     const opened = await native.open(asset);
     retryRetired(); check(options.signal);
-    if (!opened || disposed) throw error || abortError();
+    if (!opened || disposed || error) throw error || abortError();
     if (options.camera) setCamera(options.camera);
     cameraSilent = false; api.ready = true; status.remove();
     return api;
@@ -181,7 +181,7 @@ export function createThumbnailRenderer({onInvalidate = () => {}} = {}) {
       unsubscribe ??= rt.subscribeContext(() => { if (!disposed) onInvalidate(); });
       const loadModel = modelLoader(rt, asset, options.resourceBaseUrl);
       const result = prepare
-        ? await rt.prepareModelResource(asset, {signal: controller.signal})
+        ? await rt.prepareModelResource(asset, {signal: controller.signal, automatic: true})
         : await rt.renderThumbnail(asset, {...(loadModel ? {loadModel} : {}), profile: profileFor(rt, options.profile), signal: controller.signal, onSnapshot: options.onSnapshot});
       check(controller.signal); check(options.signal); if (disposed) throw abortError();
       return result;
@@ -200,18 +200,30 @@ export function createThumbnailRenderer({onInvalidate = () => {}} = {}) {
   };
 }
 
-// Preserve the previous native UI's verified GLB-only download contract. A closed
-// glTF document is not a complete model download without its resource directory.
+export function describeDownload(asset) {
+  if (asset?.format === 'gltf') {
+    const name = asset.name || asset.resource_id || 'glTF';
+    return {
+      supported: false,
+      label: name + ' · 闭合 glTF 需保留完整依赖目录',
+      reason: '闭合 glTF 含独立依赖，当前不提供不完整的单文件下载。',
+    };
+  }
+  if (asset?.format !== 'glb') return null;
+  const stem = String(asset.name || asset.resource_id || 'model').replace(/[^\p{L}\p{N}_. -]/gu, '_').replace(/\.glb$/i, '') || 'model';
+  return {supported: true, filename: stem + '.glb'};
+}
+
 // The canonical UI owns its button, Blob URL, filename presentation and click.
-export async function downloadResource(assetOrResource, {signal, resourceBaseUrl = assetOrResource?.resourceBaseUrl} = {}) {
+export async function downloadResource(assetOrResource, {signal, resourceBaseUrl = assetOrResource?.resourceBaseUrl, modelAsset} = {}) {
   check(signal);
-  const asset = assetOrResource?.originalAsset ?? assetOrResource?.modelAsset ?? assetOrResource;
-  if (!asset || asset.format !== 'glb') return {supported: false, reason: asset?.format === 'gltf' ? '闭合 glTF 含独立依赖，当前不提供不完整的单文件下载。' : '此资源没有可校验下载的 GLB。'};
+  const asset = modelAsset ?? assetOrResource?.originalAsset ?? assetOrResource?.modelAsset ?? assetOrResource;
+  const target = describeDownload(asset);
+  if (!target?.supported) return {supported: false, reason: target?.reason || '此资源没有可校验下载的 GLB。'};
   const rt = await runtime(); check(signal);
   const delivery = rt.resolveAssetDelivery(asset);
   if (delivery.status !== 'available') return {supported: false, reason: '资源供应尚未配置，不能下载。'};
   const fetcher = resourceFetcher(rt, asset, resourceBaseUrl);
   const {bytes, sha256} = await rt.loadAssetBytes(asset, {signal, ...(fetcher ? {fetcher} : {})}); check(signal);
-  const stem = String(asset.name || asset.resource_id || 'model').replace(/[^\p{L}\p{N}_. -]/gu, '_').replace(/\.glb$/i, '') || 'model';
-  return {supported: true, bytes, sha256, filename: stem + '.glb', type: 'model/gltf-binary'};
+  return {...target, bytes, sha256, type: 'model/gltf-binary'};
 }

@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -14,7 +15,7 @@ SOURCE = Path(__file__).resolve().parent.parent
 
 class Boundaries(unittest.TestCase):
     def test_both_servers(self):
-        for server, command in [('serve.py', ['python']), ('server.mjs', ['node'])]:
+        for server, command in [('serve.py', [sys.executable]), ('server.mjs', ['node'])]:
             with self.subTest(server=server), tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp)
                 root = base / 'public'

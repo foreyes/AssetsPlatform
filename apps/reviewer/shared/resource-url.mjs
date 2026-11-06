@@ -3,7 +3,13 @@
 
 const ORIGIN_FALLBACK='http://localhost';
 const abort=()=>new DOMException('Project resource request cancelled','AbortError');
-const beneath=(path,root)=>root==='/'?path.startsWith('/'):path.startsWith(root);
+// Compare decoded URL paths, matching the static servers' encoded aliases.
+const canonicalPath=value=>decodeURIComponent(value).replace(/\/+/g,'/');
+const beneath=(path,prefix,directory)=>path.startsWith(prefix)||path===directory;
+function rootPath(url){
+ const prefix=canonicalPath(url.pathname),foldedPrefix=prefix.toLowerCase();
+ return {prefix,directory:prefix.slice(0,-1),foldedPrefix,foldedDirectory:foldedPrefix.slice(0,-1)};
+}
 function safeReference(value){
  if(typeof value!=='string'||!value||/[\\\0-\x20\x7f]/.test(value)||value.startsWith('//'))throw Error('Unsafe resource reference');
  const beforeFragment=value.split('#',1)[0],path=beforeFragment.replace(/^https?:\/\/[^/]+/i,'').split('?',1)[0];
@@ -17,9 +23,32 @@ export function resolveResourceRoot(value,base){return directory(value,base).hre
 export function createResourceResolver({projectId='legacy',datasetId='verified',assetRoot,origin,resourceMounts,externalOrigins=[],registeredProjectRoots=[],nativeModuleBase,dataKind='indexed'}={}){
  const fallback=origin||globalThis.location?.origin||ORIGIN_FALLBACK,root=directory(assetRoot||'./',fallback+'/'),site=root.origin;if(origin&&new URL(origin).origin!==site)throw Error('Project assetRoot must remain on the registered site');
  const external=new Set(externalOrigins.map(value=>{const u=new URL(value);if(u.protocol!=='https:'||u.username||u.password||u.pathname!=='/'||u.search||u.hash)throw Error('Exact HTTPS external origin required');return u.origin}));
- const otherRoots=registeredProjectRoots.map(value=>directory(value,root)).filter(u=>u.origin===site&&u.href!==root.href);
+ const ownRoot=rootPath(root);
+ const otherRoots=registeredProjectRoots.map(value=>directory(value,root)).filter(u=>u.origin===site&&u.href!==root.href).map(rootPath);
+ const roots=[ownRoot,...otherRoots].sort((a,b)=>b.prefix.length-a.prefix.length);
+ const hasOtherRoot=otherRoots.some(other=>other.prefix!==ownRoot.prefix);
+ // Case folding can deny an alias on Windows, but must never grant a path
+ // outside the exact root on case-sensitive hosts. Ambiguous roots fail closed.
+ function checkedOwner(pathname){
+  // Apply to both declarations and resolved mounts; neither may grant an alias.
+  if(hasOtherRoot&&pathname.split('/').some(part=>part.includes(':')||/[. ]$/.test(part)||/~[0-9]+(?:\.|$)/i.test(part)))throw Error('Ambiguous filesystem resource alias denied');
+  const folded=pathname.toLowerCase();
+  let exact,hasCaseAlias=false;
+  for(const candidate of roots){
+   if(exact&&candidate.prefix.length<exact.prefix.length)break;
+   if(beneath(pathname,candidate.prefix,candidate.directory))exact??=candidate;
+   else if(beneath(folded,candidate.foldedPrefix,candidate.foldedDirectory))hasCaseAlias=true;
+  }
+  if(hasCaseAlias)throw Error('Cross-project case alias denied');
+  return exact;
+ }
  const specs=resourceMounts||[{logicalPrefix:dataKind==='entity'?'/entity/':'/assets/',target:dataKind==='entity'?'./':'assets/'}];
- const mounts=specs.map(spec=>{if(!spec||typeof spec.logicalPrefix!=='string'||!/^\/(?:[A-Za-z0-9._-]+\/)+$/.test(spec.logicalPrefix)||spec.logicalPrefix.split('/').includes('..'))throw Error('Registered logical resource prefix required');const target=directory(spec.target||'./',root);if(target.origin!==site||!beneath(target.pathname,root.pathname))throw Error('Resource mount escapes project root');return {prefix:spec.logicalPrefix,target}}).sort((a,b)=>b.prefix.length-a.prefix.length);
+ const mounts=specs.map(spec=>{
+  if(!spec||typeof spec.logicalPrefix!=='string'||!/^\/(?:[A-Za-z0-9._-]+\/)+$/.test(spec.logicalPrefix)||spec.logicalPrefix.split('/').includes('..'))throw Error('Registered logical resource prefix required');
+  const prefix=spec.logicalPrefix,target=directory(spec.target||'./',root);
+  if(target.origin!==site||!beneath(canonicalPath(target.pathname),ownRoot.prefix,ownRoot.directory))throw Error('Resource mount escapes project root');
+  return {prefix,target,segments:prefix.split('/').length-1};
+ }).sort((a,b)=>b.prefix.length-a.prefix.length);
  const native=new Set(),supplemental=new Map(),nativeModule=dataKind==='entity'&&nativeModuleBase?directory(nativeModuleBase,root):null;
  if(nativeModule&&nativeModule.origin!==site)throw Error('Native module base must remain on registered site');
  function externalLink(value){safeReference(value);const url=new URL(value);if(url.protocol!=='https:'||url.username||url.password||!external.has(url.origin))throw Error('External source/download origin is not registered');return value;}
@@ -32,16 +61,22 @@ export function createResourceResolver({projectId='legacy',datasetId='verified',
   if(raw.origin!==site){if(kind==='download')return externalLink(value);throw Error('External asset fetch is not permitted');}
   if(raw.search)throw Error('Local resource query is not permitted');
   if(kind==='native'){if(!native.has(raw.pathname)||raw.hash)throw Error('Unregistered native resource declaration');return raw.href;}
-  if(kind==='module'&&nativeModule&&beneath(raw.pathname,nativeModule.pathname)){if(raw.hash||!(/\.(?:mjs|js)$/.test(raw.pathname)))throw Error('Registered native JavaScript module required');return raw.href;}
-  if(otherRoots.some(u=>beneath(raw.pathname,u.pathname)&&!beneath(raw.pathname,root.pathname)))throw Error('Cross-project source path denied');
-  let target=raw;
+  if(kind==='module'&&nativeModule&&raw.pathname.startsWith(nativeModule.pathname)){if(raw.hash||!(/\.(?:mjs|js)$/.test(raw.pathname)))throw Error('Registered native JavaScript module required');return raw.href;}
+  const rawPath=canonicalPath(raw.pathname),sourceOwner=checkedOwner(rawPath);
+  // Ancestor-owned logical aliases may be mounted into a child; sibling and
+  // descendant physical roots must be rejected before applying any mount.
+  if(sourceOwner&&sourceOwner.prefix!==ownRoot.prefix&&!beneath(ownRoot.prefix,sourceOwner.prefix,sourceOwner.directory))throw Error('Cross-project source path denied');
   // Already-resolved URLs within this project are idempotent. Logical absolute
   // prefixes are mapped only when they are outside its physical public root.
-  if(!beneath(raw.pathname,root.pathname)){
-   const mapping=mounts.find(m=>raw.pathname.startsWith(m.prefix));if(!mapping)throw Error('Resource escapes the registered project root');
-   target=new URL(raw.pathname.slice(mapping.prefix.length)+raw.hash,mapping.target);
+  if(beneath(rawPath,ownRoot.prefix,ownRoot.directory)){
+   if(sourceOwner?.prefix!==ownRoot.prefix)throw Error('Cross-project resource access denied');
+   return raw.href;
   }
-  if(target.origin!==site||!beneath(target.pathname,root.pathname)||otherRoots.some(u=>beneath(target.pathname,u.pathname)&&u.pathname!==root.pathname))throw Error('Cross-project resource access denied');
+  const mapping=mounts.find(m=>rawPath.startsWith(m.prefix));
+  if(!mapping)throw Error('Resource escapes the registered project root');
+  const suffix=raw.pathname.replace(/\/+/g,'/').split('/').slice(mapping.segments).join('/');
+  const target=new URL(suffix+raw.hash,mapping.target),targetPath=canonicalPath(target.pathname),targetOwner=checkedOwner(targetPath);
+  if(target.origin!==site||targetOwner?.prefix!==ownRoot.prefix)throw Error('Cross-project resource access denied');
   return target.href;
  }
  function link(value){if(value==null||value==='')return value;const u=new URL(value,root);return resolve(value,{kind:u.origin===site?'evidence':'download'});}

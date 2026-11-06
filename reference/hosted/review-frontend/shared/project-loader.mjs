@@ -1,3 +1,4 @@
+import { MAX_DIRECTORY_PROJECTS } from './directory-policy.mjs';
 import { createJSONBudget, readBoundedJSON } from './json-budget.mjs';
 // One bootstrap and resolver for every registered project/dataset.
 import { createResourceResolver, getResourceResolver, resolveResourceRoot, validateResourceReference } from './resource-url.mjs';
@@ -12,7 +13,7 @@ function safeConfig(value, base) {
   return u;
 }
 export function resolveProjectDirectory(directory, search = '', base = 'http://localhost/') {
-  requireField(record(directory) && Array.isArray(directory.projects) && directory.projects.length > 0 && directory.projects.length <= 128, 'project-directory.json.projects', 'required non-empty array');
+  requireField(record(directory) && Array.isArray(directory.projects) && directory.projects.length > 0 && directory.projects.length <= MAX_DIRECTORY_PROJECTS, 'project-directory.json.projects', 'required non-empty array');
   if (directory.schema !== undefined) requireField(directory.schema === 'asset-review-project-directory/1', 'project-directory.json.schema', 'unsupported schema');
   const entries = directory.projects,
     ids = new Set();

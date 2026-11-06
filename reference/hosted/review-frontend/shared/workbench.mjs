@@ -1,3 +1,5 @@
+import { matchesLegacyEntityAdapter } from './review-export.mjs';
+
 export function createWorkbench(config) {
   const REVIEW_STATUSES = Object.freeze({
     pending: '未审阅',
@@ -28,7 +30,7 @@ export function createWorkbench(config) {
     if (!data || data.format !== config.importFormat || ![1, 2].includes(data.version) || !data.reviews || typeof data.reviews !== 'object' || Array.isArray(data.reviews)) throw Error(`不是支持的 ${config.label} 审阅文件`);
     if (!config.projectId || !config.datasetId) throw Error('当前项目缺少 projectId/datasetId，不能安全导入');
     if (data.version === 2) {
-      if (data.projectId !== config.projectId || data.datasetId !== config.datasetId) throw Error('审阅备份项目或数据集身份不匹配');
+      if (data.projectId !== config.projectId || (data.datasetId !== config.datasetId && !matchesLegacyEntityAdapter(config, data))) throw Error('审阅备份项目或数据集身份不匹配');
     } else {
       if (data.projectId !== undefined && data.projectId !== config.projectId || data.datasetId !== undefined && data.datasetId !== config.datasetId) throw Error('旧版审阅备份声明的项目或数据集身份不匹配');
       if (!allowLegacy) {
