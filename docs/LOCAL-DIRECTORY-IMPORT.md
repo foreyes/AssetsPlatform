@@ -59,3 +59,9 @@ new-review-workspace/
 新增自动测试使用自制立方体，覆盖实际 HTTP 启动、目录加载器/适配器/CPU 解析闭合、统计字段、占位图、稳定身份、内容变更隔离、已存在输出保护、畸形/外部模型拒绝、路径/符号链接/预算边界。运行 `node --test tests/import-directory.test.mjs`；完整回归运行 `npm test`。这些测试不证明真实浏览器 WebGL、像素、材质外观、移动设备或资产许可证已经验证。
 
 独立输出可运行 `node validate-workspace.mjs` 重查所有登记目录的描述、身份、物件/资源表和引用 GLB，不假设模型叫 cube.glb。该命令不校验 GPU、任意附件完整性或托管账号；缺失模型会返回非零退出码。源码仓库的旧 `verify.mjs` 只验证随包自制示例，不能替代此命令。
+
+离线校验支持可选文件缺省、实际 gzip 和索引 `#record`，并检查默认项目登记、目录结构和非空物件列表。压缩与解压 JSON 分别受单文件 16 MiB、累计 64 MiB 限制（重复读取计入）；畸形或不安全可选文件不会被忽略。不覆盖 GPU 外观、附加证据完整性或并发恶意文件替换。
+
+JSON 解码复用浏览器的 `readBoundedJSON`：`.gz` 按 magic 判断，兼容未压缩 JSON 与 UTF-8 BOM，损坏压缩流拒绝；每次描述文件引导另有单文件 2 MiB、累计 16 MiB 浏览器预算。
+
+数据文件的离线 16/64 MiB 预算独立于项目 `config.jsonLimits`；输出 `browserOpenability: not-verified`，不能据离线通过推断浏览器配置了更低数据预算时仍能打开。重复斜杠按实际本地服务器规范化，隐藏路径、遍历与符号链接仍拒绝。
