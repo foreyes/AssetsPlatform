@@ -62,7 +62,10 @@ class Element {
 }
 
 let fixtureId = 0;
-async function boot(t, mode, { shared = false, sharedSession, sharedList, responses = {}, storageError, initialSelection } = {}) {
+async function boot(t, mode, {
+  shared = false, sharedSession, sharedList, responses = {}, storageError, initialSelection,
+  catalogAssets = [], catalogObjects = [asset], createViewer
+} = {}) {
   const root = reviewer[mode];
   const appRoot = mode === 'hosted' ? new URL('shared/', root) : root;
   const html = await readFile(new URL('index.html', appRoot), 'utf8');
@@ -76,8 +79,8 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList, respon
   const catalogue = deferred();
   const data = {
     kind: 'entity',
-    catalog: { assets: [] },
-    objectCatalog: { objects: [asset] },
+    catalog: { assets: catalogAssets },
+    objectCatalog: { objects: catalogObjects },
     datasets: {
       verified: { id: 'verified', label: 'Verified', resources: [] },
       adapter: { id: 'adapter', label: 'Alternate', resources: [libraryAsset] }
@@ -205,7 +208,7 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList, respon
     } },
     location: { href: url, origin: config.origin, assign() {} }, localStorage, fetch, confirm, URL: FixtureURL,
     __importFixture: {
-      project, catalogue, setTimeout: (run, delay) => {
+      project, catalogue, createViewer, setTimeout: (run, delay) => {
         const timer = Symbol();
         timers.set(timer, { run, delay });
         return timer;
@@ -234,13 +237,13 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList, respon
       const loadProjectData = () => globalThis.__importFixture.catalogue.promise;
       const objectCategory = item => item.category;
     `)
-    .replace(viewerImport, 'const configureRenderer = async () => {};')
+    .replace(viewerImport, 'const { createViewer } = globalThis.__importFixture; const configureRenderer = async () => {};')
     .replace(/from '(\.\/shared\/[^']+)'/g, (_, path) => {
       // The hosted resolver imports generated private pins. This fixture has no native assets.
       const moduleRoot = path === './shared/resource-url.mjs' ? reviewer.public : root;
       return 'from ' + JSON.stringify(new URL(path, moduleRoot).href);
     })
-    .replace(/init\(\);\s*$/, 'export const ready = init(); export { itemMap, reviews, selected, openDetail };');
+    .replace(/init\(\);\s*$/, 'export const ready = init(); export { itemMap, reviews, selected, openDetail, openResource };');
   const environment = 'const { setTimeout, clearTimeout, console } = globalThis.__importFixture;\n';
   const app = await import('data:text/javascript;base64,' + Buffer.from(environment + script).toString('base64') + '#' + ++fixtureId);
   const backup = (extra = {}) => JSON.stringify({
@@ -276,6 +279,52 @@ async function boot(t, mode, { shared = false, sharedSession, sharedList, respon
 }
 
 for (const mode of Object.keys(reviewer)) {
+  test(`${mode} inherits from explicit asset then prefab then the first strictly matching source`, async t => {
+    const mesh = (id, sourceId, label = id) => ({
+      id, sourceId, type: 'mesh', modelUrl: label + '.glb', previewUrl: label + '.svg',
+      provenance: { sourceFile: label }
+    });
+    const catalogAssets = [
+      mesh('unrelated'), mesh('null-source', null), mesh('blank-source', '  '),
+      mesh('source-first', 'source'), mesh('source-second', 'source'),
+      mesh('prefab'), mesh('asset', undefined, 'asset-first'), mesh('asset', undefined, 'asset-second'),
+      mesh('text-source', '0'), mesh('numeric-source', 0), mesh(''),
+      mesh(undefined, undefined, 'missing-id'), mesh(null, null, 'null-id')
+    ];
+    const catalogObjects = [
+      { id: 'asset-wins', assetId: 'asset', prefabId: 'prefab', sourceId: 'source' },
+      { id: 'prefab-wins', assetId: 'absent', prefabId: 'prefab', sourceId: 'source' },
+      { id: 'source-fallback', prefabId: 'absent', sourceId: 'source' },
+      { id: 'asset-without-source', assetId: 'asset' },
+      { id: 'numeric-source-fallback', sourceId: 0 },
+      { id: 'string-source-fallback', sourceId: '0' },
+      { id: 'strict-source', sourceId: ' source ' },
+      { id: 'missing-source' },
+      { id: 'null-source-unmatched', assetId: null, prefabId: 'null', sourceId: null },
+      { id: 'blank-source-unmatched', assetId: '', prefabId: 'undefined', sourceId: '  ' },
+      {
+        id: 'local', assetId: 'asset', modelUrl: 'local.glb', thumbnailUrl: 'local.svg',
+        provenance: { sourceFile: 'local source' }
+      }
+    ];
+    const h = await boot(t, mode, { catalogAssets, catalogObjects });
+    await h.ready();
+    const model = id => h.app.itemMap.get(id).modelUrl;
+    assert.equal(model('asset-wins'), 'asset-first.glb');
+    assert.equal(model('prefab-wins'), 'prefab.glb');
+    assert.equal(model('source-fallback'), 'source-first.glb');
+    assert.equal(model('asset-without-source'), 'asset-first.glb');
+    assert.equal(model('numeric-source-fallback'), 'numeric-source.glb');
+    assert.equal(model('string-source-fallback'), 'text-source.glb');
+    for (const id of ['strict-source', 'missing-source', 'null-source-unmatched', 'blank-source-unmatched']) {
+      assert.equal(model(id), undefined, id);
+    }
+    const local = h.app.itemMap.get('local');
+    assert.equal(local.modelUrl, 'local.glb');
+    assert.equal(local.previewUrl, 'local.svg');
+    assert.deepEqual(local.provenance, { sourceFile: 'local source' });
+  });
+
   test(`${mode} waits for the complete catalogue, then accepts alternate assets and zero-match backups`, async t => {
     const h = await boot(t, mode);
     assert.equal(h.get('#import-btn').disabled, true);
@@ -387,6 +436,91 @@ for (const mode of Object.keys(reviewer)) {
     assert.equal(h.stored().reviews[asset.id].status, 'check');
   });
 }
+
+test('public detail shows only the active model warnings across compare and view changes', async t => {
+  const technical = {
+    ...libraryAsset, modelUrl: 'original.glb',
+    variants: [
+      { id: 'original', label: 'Original', modelUrl: 'original.glb' },
+      { id: 'variant', label: 'Variant', modelUrl: 'variant.glb' }
+    ]
+  };
+  const optional = 'Unsupported optional extension: <img src=x onerror=alert(1)>';
+  const normal = '法线贴图暂未应用；保留模型源法线';
+  const long = 'Unsupported optional extension: ' + 'x'.repeat(500);
+  const warningA = [optional, normal];
+  const warningB = [normal, 'UV1', long, '点或线拓扑未显示', '形态目标以基础静态几何显示'];
+  const view = warnings => ({ warnings, dispose() {} });
+  let start = () => view(warningA);
+  const h = await boot(t, 'public', {
+    catalogAssets: [technical],
+    createViewer: (stage, url) => start(stage, url)
+  });
+  await h.ready();
+  const warningPanel = h.get('#model-warnings');
+  const extra = h.get('#model-warnings-extra');
+  const messages = () => h.get('#model-warnings-list').children.map(entry => entry.textContent);
+  const empty = () => {
+    assert.equal(warningPanel.hidden, true);
+    assert.deepEqual(messages(), []);
+    assert.equal(extra.hidden, true);
+    assert.equal(extra.textContent, '');
+  };
+  const openTechnical = () => h.app.openResource(h.app.itemMap.get(technical.id));
+  const toggleCompare = () => h.get('#toggle-render-compare').onclick();
+  const settle = () => new Promise(setImmediate);
+
+  await openTechnical();
+  assert.equal(h.get('#detail-modal').open, true);
+  assert.equal(warningPanel.hidden, false);
+  assert.deepEqual(messages(), warningA);
+  assert(h.get('#model-warnings-list').children.every(entry => entry.innerHTML === undefined));
+  assert.match(h.get('#preview-caption').textContent, /拖动旋转/);
+  assert.equal(h.get('#animation-status').textContent, '');
+
+  const comparison = deferred();
+  const stageB = h.get('#preview-stage-b');
+  start = stage => stage === stageB ? comparison.promise : view(warningA);
+  toggleCompare();
+  empty();
+  comparison.resolve(view(warningB));
+  await settle();
+  assert.deepEqual(messages(), [...warningA, 'UV1', long.slice(0, 239) + '…', '点或线拓扑未显示']);
+  assert.equal(extra.hidden, false);
+  assert.match(extra.textContent, /1/);
+  toggleCompare();
+  await settle();
+  assert.deepEqual(messages(), warningA);
+  assert.equal(extra.hidden, true);
+
+  const variant = deferred();
+  let disposed = false;
+  start = (stage, url) => {
+    assert.equal(url, 'variant.glb');
+    return variant.promise;
+  };
+  h.get('#resource-variant').onchange({ target: { value: 'variant' } });
+  empty();
+  await h.app.openDetail(h.app.itemMap.get(asset.id));
+  variant.resolve({ ...view(['stale warning']), dispose() { disposed = true; } });
+  await settle();
+  empty();
+  assert.equal(disposed, true);
+
+  start = () => { throw Error('failed preview'); };
+  await openTechnical();
+  empty();
+  assert.match(h.get('#preview-caption').textContent, /暂未成功加载/);
+
+  start = () => view(warningA);
+  await openTechnical();
+  h.get('#detail-modal').close();
+  empty();
+  await openTechnical();
+  assert.deepEqual(messages(), warningA);
+  h.dispatch('pagehide');
+  empty();
+});
 
 test('hosted ignores stale success and failure without clearing the newer input', async t => {
   const h = await boot(t, 'hosted');

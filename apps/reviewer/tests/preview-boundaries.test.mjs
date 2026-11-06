@@ -11,7 +11,22 @@ function model(change){const json=structuredClone(original);change(json);let tex
 function png(w,h){const b=Buffer.alloc(24);b.writeUInt32BE(0x89504e47);b.writeUInt32BE(0x0d0a1a0a,4);b.writeUInt32BE(13,8);b.writeUInt32BE(0x49484452,12);b.writeUInt32BE(w,16);b.writeUInt32BE(h,20);return b;}
 test('real packaged cube remains parseable',()=>assert(parseGLB(source).primitives.length>0));
 test('every unknown required extension fails closed',()=>{for(const ext of ['UNKNOWN_required','KHR_draco_mesh_compression','EXT_meshopt_compression'])assert.throws(()=>parseGLB(model(j=>j.extensionsRequired=[ext])),/Unsupported required extension/);});
-test('unknown optional extension is disclosed',()=>assert(parseGLB(model(j=>j.extensionsUsed=['UNKNOWN_optional'])).warnings.includes('Unsupported optional extension: UNKNOWN_optional')));
+test('optional extensions and unapplied material inputs disclose distinct preview warnings', () => {
+  const optional = 'UNKNOWN_optional';
+  const geometry = parseGLB(model(json => {
+    json.extensionsUsed = [optional, optional];
+    json.textures = [{ source: 0 }];
+    json.images = [{ uri: 'data:image/png;base64,' + png(1, 1).toString('base64') }];
+    json.materials[0].normalTexture = { index: 0 };
+    json.materials[0].pbrMetallicRoughness.baseColorTexture = { index: 0, texCoord: 1 };
+  }));
+  assert(geometry.primitives.length > 0);
+  assert.deepEqual(geometry.warnings, [
+    'Unsupported optional extension: ' + optional,
+    '当前仅支持 UV0，其他 UV 通道的贴图未应用',
+    '法线贴图暂未应用；保留模型源法线'
+  ]);
+});
 test('required implemented unlit material remains supported',()=>assert(parseGLB(model(j=>j.extensionsRequired=['KHR_materials_unlit'])).primitives.length));
 test('aggregate accessor allocation checked before access',()=>assert.throws(()=>parseGLB(model(j=>j.accessors=Array.from({length:9},()=>({count:1048576,type:'SCALAR',componentType:5126})))),/aggregate accessor values/));
 test('node and image collection limits checked',()=>{assert.throws(()=>parseGLB(model(j=>j.nodes=Array(4097).fill({}))),/nodes/);assert.throws(()=>parseGLB(model(j=>j.images=Array(129).fill({}))),/images/);});

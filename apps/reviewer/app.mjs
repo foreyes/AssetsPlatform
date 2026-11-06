@@ -243,8 +243,11 @@ function normalizeResource(record) {
     notes: Array.isArray(record.notes) ? record.notes : [record.notes].filter(Boolean)
   };
 }
-function normalizeObject(record) {
-  const base = resources.find(a => a.id === record.assetId || a.id === record.prefabId || a.sourceId === record.sourceId) || {};
+function isUsableIdentity(id) {
+  return (typeof id === 'string' && id.trim() !== '') || Number.isFinite(id);
+}
+function normalizeObject(record, basesById, basesBySourceId) {
+  const base = basesById.get(record.assetId) ?? basesById.get(record.prefabId) ?? basesBySourceId.get(record.sourceId) ?? {};
   const merged = {
     ...base,
     ...record
@@ -398,11 +401,18 @@ async function init() {
     if (projectData.defaultFilters && !config.defaultFacets) state.facets = {
       ...projectData.defaultFilters
     };
-    resources = (catalog.assets || []).map(normalizeResource);
+    const basesById = new Map(),
+      basesBySourceId = new Map();
+    resources = (catalog.assets || []).map(record => {
+      const resource = normalizeResource(record);
+      if (isUsableIdentity(record.id) && !basesById.has(resource.id)) basesById.set(resource.id, resource);
+      if (isUsableIdentity(record.sourceId) && !basesBySourceId.has(record.sourceId)) basesBySourceId.set(record.sourceId, resource);
+      return resource;
+    });
     resourceMap = new Map(resources.map(a => [a.id, a]));
     sourceMap = new Map(resources.filter(a => a.sourceId).map(a => [a.sourceId, a]));
     objects = (objectCatalog.objects || objectCatalog.assets || []).map((record, index) => ({
-      ...normalizeObject(record),
+      ...normalizeObject(record, basesById, basesBySourceId),
       catalogOrder: index
     }));
     if (!objects.length) throw Error('物件目录暂不可用');
@@ -925,6 +935,27 @@ function selectPlayableClip(id, autoplay = false) {
     preventScroll: true
   });
 }
+function showModelWarnings(...viewers) {
+  const maxVisible = 5;
+  const maxLength = 240;
+  const warnings = new Set();
+  for (const viewer of viewers) {
+    for (const warning of viewer?.warnings || []) {
+      if (warning.trim()) warnings.add(warning);
+    }
+  }
+  const entries = [...warnings].slice(0, maxVisible).map(warning => {
+    const entry = document.createElement('li');
+    entry.textContent = warning.length > maxLength ? warning.slice(0, maxLength - 1) + '…' : warning;
+    return entry;
+  });
+  const omitted = warnings.size - entries.length;
+  const extra = $('#model-warnings-extra');
+  $('#model-warnings-list').replaceChildren(...entries);
+  extra.textContent = omitted ? `另有 ${omitted} 条预览限制未显示` : '';
+  extra.hidden = !omitted;
+  $('#model-warnings').hidden = !entries.length;
+}
 async function startViewers(preserveCamera = false, preservePlayback = true) {
   const previousCamera = preserveCamera ? viewerA?.getCamera?.() : undefined,
     preserved = preserveCamera && preservePlayback ? {
@@ -941,6 +972,7 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
   viewerB?.dispose();
   viewerA = null;
   viewerB = null;
+  showModelWarnings();
   playback.configure([]);
   const item = current;
   if (!item) return;
@@ -1026,8 +1058,10 @@ async function startViewers(preserveCamera = false, preservePlayback = true) {
     bindAnimationControls(item, animationRecord, preserved, animationData);
     if (animationClips.length) $('#preview-disclaimer').textContent = '几何、材质与动作来自可验证的源引用。当前模式只播放已验证的原始轨道或离线约束派生结果，不是 Unity 实际运行；未重现游戏脚本、粒子、音效、事件、动态风或完整 Unity Animator。';
     $('#preview-caption').textContent = (currentVariant?.label ? currentVariant.label + ' · ' : '') + (comparison ? '双视图联动机位与动作时间 · 拖动旋转 · 滚轮缩放' : '拖动旋转 · 滚轮缩放' + (config.renderer.compare === false ? '' : ' · 可开启同机位对比'));
+    showModelWarnings(viewerA, viewerB);
   } catch (error) {
     if (request !== viewerRequest) return;
+    showModelWarnings();
     viewerA?.dispose();
     viewerB?.dispose();
     viewerA = null;
@@ -1234,6 +1268,7 @@ function closeDetail() {
   viewerB?.dispose();
   viewerA = null;
   viewerB = null;
+  showModelWarnings();
   current = null;
   render();
 }
@@ -1536,6 +1571,7 @@ window.addEventListener('pagehide', () => {
   viewerA?.dispose();
   viewerB?.dispose();
   viewerA = viewerB = null;
+  showModelWarnings();
 });
 window.addEventListener('pagehide', saveComment);
 window.addEventListener('pagehide', event => {

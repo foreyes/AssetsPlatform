@@ -245,8 +245,11 @@ function normalizeResource(record) {
     notes: Array.isArray(record.notes) ? record.notes : [record.notes].filter(Boolean)
   };
 }
-function normalizeObject(record) {
-  const base = resources.find(a => a.id === record.assetId || a.id === record.prefabId || a.sourceId === record.sourceId) || {};
+function isUsableIdentity(id) {
+  return (typeof id === 'string' && id.trim() !== '') || Number.isFinite(id);
+}
+function normalizeObject(record, basesById, basesBySourceId) {
+  const base = basesById.get(record.assetId) ?? basesById.get(record.prefabId) ?? basesBySourceId.get(record.sourceId) ?? {};
   const merged = {
     ...base,
     ...record
@@ -404,11 +407,18 @@ async function init() {
     if (projectData.defaultFilters && !config.defaultFacets) state.facets = {
       ...projectData.defaultFilters
     };
-    resources = (catalog.assets || []).map(normalizeResource);
+    const basesById = new Map(),
+      basesBySourceId = new Map();
+    resources = (catalog.assets || []).map(record => {
+      const resource = normalizeResource(record);
+      if (isUsableIdentity(record.id) && !basesById.has(resource.id)) basesById.set(resource.id, resource);
+      if (isUsableIdentity(record.sourceId) && !basesBySourceId.has(record.sourceId)) basesBySourceId.set(record.sourceId, resource);
+      return resource;
+    });
     resourceMap = new Map(resources.map(a => [a.id, a]));
     sourceMap = new Map(resources.filter(a => a.sourceId).map(a => [a.sourceId, a]));
     objects = (objectCatalog.objects || objectCatalog.assets || []).map((record, index) => ({
-      ...normalizeObject(record),
+      ...normalizeObject(record, basesById, basesBySourceId),
       catalogOrder: index
     }));
     if (!objects.length) throw Error('物件目录暂不可用');
