@@ -3,7 +3,8 @@
 import {REVIEWED_PREVIEW_PROJECTS} from './reviewed-preview-projects.mjs';
 import {scope, validateManifest, rootURL} from '../incremental-candidate/manifest.mjs';
 const VERSION = /^v-[a-f0-9]{64}$/;
-export const MAX_DIRECTORY_DATASETS = 128;
+import {MAX_ACTIVE_DATASETS} from '../review-frontend/shared/directory-policy.mjs';
+export const MAX_DIRECTORY_DATASETS = MAX_ACTIVE_DATASETS;
 export const DESCRIPTOR_POLICY_FILE = 'project-config-policy-v2.json';
 const headers = {'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'};
 const reply = (value, method='GET', immutable=false) => new Response(method==='HEAD'?null:JSON.stringify(value), {headers:{...headers,'Content-Type':'application/json',...(immutable?{'Cache-Control':'private, max-age=86400, immutable'}:{})}});
