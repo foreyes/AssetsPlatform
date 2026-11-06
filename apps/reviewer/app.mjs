@@ -1,7 +1,7 @@
 import { createJSONBudget, readBoundedJSON } from './shared/json-budget.mjs';
 import { importReviewBackup, canRestoreReviewSnapshot, restoreReviewSnapshot } from './shared/review-import.mjs';
 import { commonIndexedProfiles } from './shared/common-render-profiles.mjs';
-import { exportAssetIndex, reviewBackupIdentity } from './shared/review-export.mjs';
+import { exportAssetIndex, reviewBackupIdentity, reviewExportBlob, reviewStateSnapshot } from './shared/review-export.mjs';
 import { describePreviewFailure, showPreviewFailure } from './shared/preview-failure-5e4d0bcf88f3.mjs';
 import { guardStartup } from './shared/startup-state.mjs';
 import { mountPartnerSelections } from './shared/selection-client.mjs';
@@ -1305,7 +1305,7 @@ function changeView(view) {
   }
 }
 function download(name, content, type) {
-  const blob = new Blob([content], {
+  const blob = content instanceof Blob ? content : new Blob([content], {
       type
     }),
     url = URL.createObjectURL(blob),
@@ -1325,7 +1325,7 @@ function exportJSON(all = false) {
     catalogVersion: catalog.version,
     objectCatalogVersion: objectCatalog.version,
     scope: all ? 'full-catalogue' : 'selected',
-    notice: '包含目录索引、选择和审阅记录，可导入恢复审阅；不包含模型字节、完整依赖或原工程备份。个人审阅记录来自当前浏览器，不自动同步。',
+    notice: '包含目录索引、选择和审阅记录；恢复须符合导入大小限制；不包含模型字节、完整依赖或原工程备份。个人审阅记录来自当前浏览器，不自动同步。',
     selected: [...selected],
     reviews: Object.fromEntries(Object.entries(reviews).filter(([id]) => all || selected.has(id))),
     ...(config.compactExports ? {
@@ -1335,8 +1335,23 @@ function exportJSON(all = false) {
     assetMetadataOnly: true,
     assets: exportAssetIndex(subset)
   };
-  download(`${config.exportPrefix}_${all ? 'Catalogue' : 'Review'}_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json');
-  showToast(all ? '完整目录与审阅记录已导出' : '所选物件与审阅记录已导出');
+  const {blob, restorable} = reviewExportBlob(payload, config);
+  if (!restorable) alert(`目录报告超过 ${config.importLimitMiB} MiB 导入上限，不能用于恢复。请另用“导出完整审阅快照”；若快照也超限，请保留当前浏览器状态。`);
+  download(`${config.exportPrefix}_${all ? 'Catalogue' : 'Review'}_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
+  showToast(restorable ? (all ? '完整目录与审阅记录已导出' : '所选物件与审阅记录已导出') : '目录报告已导出，但超过导入上限，不能恢复');
+}
+function exportReviewSnapshot() {
+  if (!isReviewImportReady) {
+    showToast('资产目录尚未载入，不能导出可恢复快照');
+    return;
+  }
+  const {blob, restorable} = reviewExportBlob(reviewStateSnapshot(config, reviews, selected), config);
+  if (!restorable) {
+    alert(`完整审阅快照超过 ${config.importLimitMiB} MiB 导入上限，未导出可恢复备份。请保留当前浏览器状态，不要清理或替换；需要维护者协助处理。`);
+    return;
+  }
+  download(`${config.exportPrefix}_ReviewSnapshot_${new Date().toISOString().slice(0, 10)}.json`, blob, 'application/json');
+  showToast('完整审阅快照已导出（审阅和选择，不含资产索引或模型）');
 }
 function exportCSV() {
   const rows = [['ID', 'Name', 'Type', 'Source file', 'Path ID', 'Vertices', 'Triangles', 'Preview mode', 'Review', 'Comment'], ...items.filter(a => selected.has(a.id)).map(a => [a.id, a.name, a.type, a.provenance?.sourceFile, a.provenance?.pathId, a.vertexCount, a.triangleCount, previewLabel(a), REVIEW_STATUSES[reviewOf(a).status], reviewOf(a).comment])];
@@ -1371,6 +1386,11 @@ function buildAudit() {
   button.textContent = '导出目录与审阅记录';
   button.onclick = () => exportJSON(true);
   content.append(button);
+  const snapshot = document.createElement('button');
+  snapshot.className = 'primary-btn';
+  snapshot.textContent = '导出完整审阅快照';
+  snapshot.onclick = exportReviewSnapshot;
+  content.append(snapshot);
   const load = document.createElement('button');
   load.id = 'audit-import';
   load.className = 'light-btn';
@@ -1452,6 +1472,7 @@ $('#clear-selection').onclick = () => {
 $('#compare-btn').onclick = compareSelected;
 $('#export-csv').onclick = exportCSV;
 $('#export-json').onclick = () => exportJSON(false);
+$('#export-snapshot').onclick = exportReviewSnapshot;
 $('#export-all').onclick = () => exportJSON(true);
 $('#audit-btn').onclick = () => $('#audit-modal').showModal();
 $('#profiles-btn').onclick = () => $('#profiles-modal').showModal();

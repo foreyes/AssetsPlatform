@@ -169,7 +169,7 @@ async function boot(t, mode, {
     return new Response(JSON.stringify(body));
   };
   const timers = new Map();
-  const downloads = [], blobs = new Map(), confirmations = [];
+  const downloads = [], blobs = new Map(), confirmations = [], alerts = [];
   let acceptConfirmation = true;
   const confirm = message => {
     confirmations.push(message);
@@ -206,7 +206,7 @@ async function boot(t, mode, {
       if (!windowEvents.has(name)) windowEvents.set(name, []);
       windowEvents.get(name).push(run);
     } },
-    location: { href: url, origin: config.origin, assign() {} }, localStorage, fetch, confirm, URL: FixtureURL,
+    location: { href: url, origin: config.origin, assign() {} }, localStorage, fetch, confirm, alert: message => alerts.push(message), URL: FixtureURL,
     __importFixture: {
       project, catalogue, createViewer, setTimeout: (run, delay) => {
         const timer = Symbol();
@@ -259,7 +259,7 @@ async function boot(t, mode, {
   const stored = () => JSON.parse(values.get(config.reviewKey));
   const dispatch = event => windowEvents.get(event)?.forEach(run => run({ persisted: true }));
   return {
-    app, get, config, buttons, calls, values, stored, requests, choose, backup, dispatch, downloads, confirmations,
+    app, get, config, buttons, calls, values, stored, requests, choose, backup, dispatch, downloads, confirmations, alerts,
     cardCheckbox: () => cards[0].querySelector('.card-check'),
     setStorageError: error => { storageError = error; },
     acceptConfirmation: value => { acceptConfirmation = value; },
@@ -820,4 +820,36 @@ test('manifest resolver rejects inherited pointers and inherited or missing shar
       /交付分片缺少资源 root/
     );
   }
+});
+
+
+test('public full review snapshot round-trips exact and merge without report index or sidecars', async t => {
+  const h = await boot(t, 'public');
+  h.get('#export-snapshot').onclick(); assert.equal(h.downloads.length, 0);
+  await h.ready();
+  h.get('#export-snapshot').onclick();
+  const text = await h.downloads[0].blob.text(), payload = JSON.parse(text);
+  assert.equal(payload.scope, 'full-catalogue');
+  assert.equal(payload.reviews.one.comment, oldReview.comment);
+  assert(!('assets' in payload)); assert(!('animationPreviewRecords' in payload));
+  const {createWorkbench} = await import('../apps/reviewer/shared/workbench.mjs');
+  for (const exact of [false, true]) assert.equal(createWorkbench(h.config).parseReviewImport(text, new Set(['one']), {exact}).reviews.one.comment, oldReview.comment);
+  h.get('#export-all').onclick();
+  const report = JSON.parse(await h.downloads[1].blob.text());
+  assert.equal(report.assets.length, 2); assert.equal(report.assetMetadataOnly, true);
+});
+
+test('public oversized report warns before download; oversized UTF-8 state refuses backup success', async t => {
+  const h = await boot(t, 'public'); await h.ready();
+  h.app.reviews.one.comment = '中文'.repeat(100);
+  const {reviewStateSnapshot, reviewExportBlob} = await import('../apps/reviewer/shared/review-export.mjs');
+  const payload = reviewStateSnapshot(h.config, h.app.reviews, h.app.selected);
+  const text = JSON.stringify(payload, null, 2), bytes = new Blob([text]).size;
+  assert(bytes > text.length);
+  h.config.importLimitMiB = (text.length + 1) / 1024 / 1024;
+  assert.equal(reviewExportBlob(payload, h.config).restorable, false);
+  h.get('#export-snapshot').onclick();
+  assert.equal(h.downloads.length, 0); assert.match(h.alerts[0], /未导出可恢复备份/);
+  h.get('#export-all').onclick();
+  assert.equal(h.downloads.length, 1); assert.match(h.alerts[1], /不能用于恢复/);
 });
