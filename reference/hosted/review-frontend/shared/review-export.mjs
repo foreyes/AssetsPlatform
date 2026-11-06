@@ -13,3 +13,9 @@ export function reviewBackupIdentity(config) {
     datasetId: config.datasetId
   };
 }
+
+// The old Entity library switch wrote "adapter" under the same review identity.
+export function matchesLegacyEntityAdapter(config, record) {
+  return config.dataKind === 'entity' && config.projectId === 'entity' && config.datasetId === 'verified'
+    && record.projectId === config.projectId && record.datasetId === 'adapter';
+}

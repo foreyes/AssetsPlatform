@@ -1,5 +1,6 @@
 import {validateCatalogData} from '../shared/project-schema.mjs';
 import fs from'node:fs';import path from'node:path';import assert from'node:assert/strict';import{fileURLToPath,pathToFileURL}from'node:url';
+import {resolveObjectURL} from 'node:buffer';
 import{loadData as indexed}from'../adapters/indexed-data.mjs';import{loadEntityData}from'../adapters/entity-data.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),base=path.dirname(root);
 class Element{constructor(id){this.id=id;this.name=id;this.dataset={};this.children=[];this.files=[];this.value='';this.textContent='';this.innerHTML='';this.hidden=false;this.disabled=false;this.open=false;this.isConnected=true;this.firstChild={textContent:''};this.style={setProperty(){}};this.classList={toggle(){},add(){},remove(){},contains(){return false}};this.attributes=new Map()}
@@ -21,7 +22,14 @@ for(const id of(process.argv.slice(2).length?process.argv.slice(2):['paradise','
  const elements=new Map(),saved=new Map(),get=s=>{if(!elements.has(s))elements.set(s,new Element(s));return elements.get(s)};globalThis.__previewNodes=[];
  globalThis.document={body:get('body'),hidden:false,activeElement:{tagName:'BODY'},querySelector:get,getElementById:id=>get('#'+id),querySelectorAll:()=>[],createElement:t=>new Element(t),addEventListener(){}};
  const windowEvents=new Map();globalThis.window={addEventListener:(name,fn)=>{if(!windowEvents.has(name))windowEvents.set(name,[]);windowEvents.get(name).push(fn)}};globalThis.location={href:url,search:'',origin:'https://fixture.invalid',assign(){}};globalThis.localStorage={getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v)};
- if(id==='entity'){saved.set(config.selectionStorageKey,JSON.stringify([data.defaultObjects[0].id]));saved.set(config.renderPreferenceKey,'entity_unlit')}
+ if(id==='entity'){
+  const verifiedId=data.defaultObjects[0].id;
+  saved.set(config.reviewKey,JSON.stringify({version:1,projectId:id,datasetId:'adapter',reviews:{
+   [verifiedId]:{status:'keep',comment:'Review saved before the library switch'}
+  }}));
+  saved.set(config.selectionStorageKey,JSON.stringify([verifiedId]));
+  saved.set(config.renderPreferenceKey,'entity_unlit');
+ }
  globalThis.fetch=async(value,options)=>{assert.equal(options.redirect,'error');return new Response(JSON.stringify(await readJSON(value)))};
  let sourceText=fs.readFileSync(path.join(root,'shared/app.mjs'),'utf8');
  sourceText=replaceRequired(sourceText,/import\s*\{\s*loadProject\s*,\s*loadProjectData\s*,\s*objectCategory\s*,\s*assetURL\s*\}\s*from\s*['\"]\.\/shared\/project-loader\.mjs['\"]\s*;/,"const loadProject=async()=>globalThis.__fixtureProject,loadProjectData=async()=>globalThis.__fixtureData,objectCategory=r=>r.objectCategory||r.category||'other',assetURL=(c,p)=>getResourceResolver(c).resolve(p);");
@@ -35,7 +43,42 @@ for(const id of(process.argv.slice(2).length?process.argv.slice(2):['paradise','
  const item=app.filterItems()[0];app.toggleSelection(item.id,true);app.goToPage(3);assert(app.selected.has(item.id));assert(saved.get(config.reviewKey).includes(item.id)||id!=='entity');if(id==='entity')assert(saved.get(config.selectionStorageKey).includes(item.id));
  get('#search').oninput({target:{value:'__no_matching_asset_909__'}});assert.equal(app.filterItems().length,0);assert.equal(app.state.page,1);app.changeView('objects');assert.equal(app.filterItems().length,expected);
  await app.openDetail(item);assert.equal(app.viewerCalls.at(-1)?.options.modelAsset,item.modelAsset);if(id==='entity'){assert.strictEqual(app.viewerCalls.at(-1).options.modelAsset,item.modelAsset);assert.equal(app.defaultProfile,'entity_unlit');assert.equal(get('#toggle-render-compare').hidden,false);assert(get('#toggle-render-compare').disabled);assert(!app.canPlayAnimation(item));assert(!app.playback.getState().available);app.setDefaultPreview('entity_current');assert.equal(saved.get(config.renderPreferenceKey),'entity_current');assert.equal(app.objects.length,1664);assert.deepEqual(app.filterItems().map(x=>x.id),data.defaultObjects.map(x=>x.id));const originalFacets={...app.state.facets};app.state.facets.publication='quarantined';app.state.facets.status='all';assert.equal(app.filterItems().length,25);assert(app.filterItems().every(x=>!x.modelAsset&&!x.modelUrl));app.state.facets.publication='all';app.state.facets.status='associated-model';assert.equal(app.filterItems().length,670);app.state.facets={...originalFacets};assert.equal(app.selected.has(data.defaultObjects[0].id),true)}app.closeDetail();
- app.changeView('technical');if(id==='entity'){assert.equal(app.filterItems().length,process.env.ENTITY_SUPPLEMENTAL_SNAPSHOT?981:894);app.changeDataset('adapter');assert.equal(app.config.datasetId,'adapter');assert.equal(app.filterItems().length,4);app.changeDataset('verified');assert.equal(app.filterItems().length,process.env.ENTITY_SUPPLEMENTAL_SNAPSHOT?981:894)}else assert.equal(app.filterItems().length,{paradise:2018,sulfur:27777}[id]);
+ app.changeView('technical');
+ if(id==='entity'){
+  const verifiedCount=process.env.ENTITY_SUPPLEMENTAL_SNAPSHOT?981:894;
+  assert.equal(app.filterItems().length,verifiedCount);
+  assert.equal(app.reviews[item.id].comment,'Review saved before the library switch');
+  const datasetSelect=get('#dataset-select');
+  datasetSelect.onchange({target:{value:'adapter'}});
+  assert.equal(app.config.datasetId,'verified');
+  assert.equal(app.filterItems().length,4);
+  const adapterItem=app.filterItems()[0];
+  assert.equal(adapterItem.datasetId,'adapter');
+  app.toggleSelection(adapterItem.id,true);
+  const legacyBackup={format:config.importFormat,version:2,projectId:id,datasetId:'adapter',reviews:{
+   [adapterItem.id]:{status:'check',comment:'Review from the old adapter backup'}
+  }};
+  await get('#import-file').onchange({target:{files:[new Blob([JSON.stringify(legacyBackup)])]}});
+  const savedReview=JSON.parse(saved.get(config.reviewKey));
+  assert.equal(savedReview.datasetId,'verified');
+  assert.equal(savedReview.reviews[item.id].status,'keep');
+  assert.equal(savedReview.reviews[adapterItem.id].comment,'Review from the old adapter backup');
+  assert(JSON.parse(saved.get(config.selectionStorageKey)).includes(adapterItem.id));
+  get('#export-all').onclick();
+  const backup=JSON.parse(await resolveObjectURL(document.body.children.at(-1).href).text());
+  assert.equal(backup.datasetId,'verified');
+  for(const entry of [item,adapterItem]){
+   assert(backup.assets.some(asset=>asset.id===entry.id));
+   assert(backup.selected.includes(entry.id));
+   assert.deepEqual(backup.reviews[entry.id],savedReview.reviews[entry.id]);
+  }
+  app.changeView('objects');
+  app.changeView('technical');
+  assert(app.filterItems().some(entry=>entry.id===adapterItem.id));
+  datasetSelect.onchange({target:{value:'verified'}});
+  assert.equal(app.config.datasetId,'verified');
+  assert.equal(app.filterItems().length,verifiedCount);
+ }else assert.equal(app.filterItems().length,{paradise:2018,sulfur:27777}[id]);
  app.changeView('objects');const image=new Element('img'),label=new Element('label'),node=new Element('node');node.dataset.renderId=item.id;node.querySelector=s=>s==='img'?image:label;globalThis.__previewNodes=[node];app.render();await new Promise(r=>setImmediate(r));assert(image.src?.startsWith('blob:'),'card generated with common queue');assert.strictEqual(app.thumbnailCalls.at(-1).options.modelAsset,item.modelAsset);
  // Real common app departure must abort its pending metadata/model, discard late
  // viewers, and remain usable on bfcache Back (not permanently disposed).

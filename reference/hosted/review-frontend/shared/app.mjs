@@ -87,6 +87,7 @@ let state = {
   layout: 'grid'
 };
 let projectData,
+  activeLibraryDataset,
   currentVariant = null,
   hierarchyRequest = 0,
   resourceRequest = 0,
@@ -94,6 +95,7 @@ let projectData,
   resourceAbort = null;
 let reviews = Object.create(null),
   selected = new Set(),
+  unavailableSelected = [],
   storageOK = true,
   current = null,
   filtered = [],
@@ -215,7 +217,7 @@ function reviewOf(item) {
 function persist() {
   storageOK = saveReviewState(localStorage, config, {
     reviews,
-    selected,
+    selected: [...selected, ...unavailableSelected],
     legacySelected
   });
   $('#storage-warning').hidden = storageOK;
@@ -392,6 +394,9 @@ async function init() {
   loadState();
   try {
     projectData = await loadProjectData(project, readJSON);
+    const libraryDatasets = Object.keys(projectData.datasets ?? {});
+    const preferredLibraries = [config.defaultFacets?.libraryDataset, config.datasetId, projectData.defaultFilters?.libraryDataset];
+    activeLibraryDataset = preferredLibraries.find(id => libraryDatasets.includes(id)) ?? libraryDatasets[0];
     catalog = projectData.catalog;
     objectCatalog = projectData.objectCatalog;
     if (projectData.profiles) defaultProfiles = projectData.profiles;
@@ -442,7 +447,13 @@ async function init() {
       }
     }
     const known = new Set(itemMap.keys());
-    reviews = sanitizeReviews(reviews, known);
+    // A missing optional manifest is not evidence that its saved records were deleted.
+    if (projectData.kind === 'entity' && !projectData.datasets.adapter) {
+      reviews = sanitizeReviews(reviews, new Set(Object.keys(reviews)));
+      unavailableSelected = [...selected].filter(id => !known.has(id));
+    } else {
+      reviews = sanitizeReviews(reviews, known);
+    }
     selected = new Set([...selected].filter(id => known.has(id)));
     configureShell();
     buildProfiles();
@@ -514,9 +525,16 @@ function renderStats() {
   $('#stat-reviewed-caption').textContent = '当前浏览器的审阅记录';
   $('#selected-count').textContent = selected.size;
   $('#reviewed-count').textContent = reviewed;
-  $('#selection-bar').hidden = !selected.size;
-  $('#selection-number').textContent = selected.size;
+  const unavailableCount = unavailableSelected.length;
+  const selectionCount = selected.size + unavailableCount;
+  $('#selection-bar').hidden = !selectionCount;
+  $('#selection-number').textContent = selectionCount;
+  const unavailableStatus = $('#selection-unavailable');
+  unavailableStatus.hidden = !unavailableCount;
+  unavailableStatus.textContent = unavailableCount ? `其中 ${unavailableCount} 项暂不可用` : '';
   $('#compare-btn').disabled = selected.size < 2 || selected.size > 4;
+  $('#export-csv').disabled = !selected.size;
+  $('#export-json').disabled = !selected.size;
 }
 function canPlayAnimation(item) {
   const record = animationRecords.get(item.id);
@@ -1248,6 +1266,7 @@ function resetFilters() {
     },
     page: 1
   };
+  if (state.view === 'technical' && activeLibraryDataset) state.facets.libraryDataset = activeLibraryDataset;
   if (config.capabilities.animationFilters) $('#animation-filter').value = 'all';
   $('#search').value = '';
   $('#category-filter').value = 'all';
@@ -1288,7 +1307,7 @@ function exportJSON(all = false) {
     objectCatalogVersion: objectCatalog.version,
     scope: all ? 'full-catalogue' : 'selected',
     notice: '包含目录索引、选择和审阅记录，可导入恢复审阅；不包含模型字节、完整依赖或原工程备份。个人审阅记录来自当前浏览器，不自动同步。',
-    selected: [...selected],
+    selected: all ? [...selected, ...unavailableSelected] : [...selected],
     reviews: Object.fromEntries(Object.entries(reviews).filter(([id]) => all || selected.has(id))),
     ...(config.compactExports ? {
       animationPreviewRecords: [...animationRecords.values()],
@@ -1398,6 +1417,7 @@ $$('[data-bg]').forEach(button => button.onclick = () => {
 });
 $('#clear-selection').onclick = () => {
   selected.clear();
+  unavailableSelected = [];
   persist();
   render();
 };
@@ -1672,7 +1692,7 @@ function invalidatePreviews() {
   if (!document.hidden && !$('#detail-modal').open) queueMicrotask(scheduleCardPreviews);
 }
 function activeResources() {
-  return projectData?.datasets?.[config.datasetId]?.resources?.map(raw => itemMap.get(raw.id) || raw) || resources;
+  return projectData?.datasets?.[activeLibraryDataset]?.resources?.map(raw => itemMap.get(raw.id) || raw) || resources;
 }
 function renderDynamicFacets() {
   const host = $('#facet-filters');
@@ -1690,7 +1710,7 @@ function renderDynamicFacets() {
     }[key];
     const control = document.createElement('select');
     control.dataset.facet = key;
-    const options = key === 'librarySource' ? (projectData.datasets?.[config.datasetId]?.sources || []).map(s => ({
+    const options = key === 'librarySource' ? (projectData.datasets?.[activeLibraryDataset]?.sources || []).map(s => ({
       value: s.id,
       label: s.label || s.id
     })) : projectData.filterOptions[key] || [];
@@ -1781,11 +1801,11 @@ function configureShell() {
       option.textContent = dataset.label;
       select.append(option);
     }
-    select.value = config.datasetId;
+    select.value = activeLibraryDataset;
   }
 }
 function changeDataset(id) {
-  if (!projectData.datasets?.[id] || id === config.datasetId) return;
+  if (!projectData.datasets?.[id] || id === activeLibraryDataset) return;
   resourceScope.invalidate();
   resourceAbort?.abort();
   hierarchyAbort?.abort();
@@ -1803,7 +1823,7 @@ function changeDataset(id) {
   thumbnailObserver?.disconnect();
   thumbnailEpoch++;
   if ($('#detail-modal').open) $('#detail-modal').close();
-  config.datasetId = id;
+  activeLibraryDataset = id;
   for (const key of ['source', 'type', 'librarySource']) state.facets[key] = 'all';
   state.facets.libraryDataset = id;
   state.view = 'technical';
