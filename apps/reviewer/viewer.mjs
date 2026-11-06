@@ -3,7 +3,7 @@
 // No libraries, original game code, or external services.
 // Lighting profiles are browser approximations, never the original Unity shaders.
 // Deliberately bounded preview subset, not a complete glTF implementation. Per model.
-export const PREVIEW_LIMITS=Object.freeze({downloadBytes:64*1024*1024,jsonBytes:8*1024*1024,accessorValues:8*1024*1024,nodes:4096,depth:128,materials:2048,images:128,imageBytes:32*1024*1024,imagePixels:32*1024*1024,imageDimension:8192,primitives:4096,vertices:1000000,indices:3000000});
+export const PREVIEW_LIMITS=Object.freeze({downloadBytes:64*1024*1024,jsonBytes:8*1024*1024,accessorValues:8*1024*1024,nodes:4096,depth:128,materials:2048,images:128,imageBytes:32*1024*1024,imagePixels:32*1024*1024,imageDimension:8192,textureBytes:192*1024*1024,primitives:4096,vertices:1000000,indices:3000000});
 // Only these required semantics are implemented; optional unknown semantics warn.
 export const SUPPORTED_REQUIRED_EXTENSIONS=Object.freeze(['KHR_materials_unlit','KHR_materials_emissive_strength']);
 function budget(value,max,label){if(!Number.isSafeInteger(value)||value<0||value>max)throw Error('Preview budget exceeded: '+label);return value;}
@@ -448,7 +448,7 @@ function includeVisibleTriangleBounds(primitive,min,max) {
 export function createSourceAnimation(geometry,data) {
   const source=geometrySources.get(geometry),diagnostics=[],compiled=new Map(),bindings=new Map();
   const info=geometry.extras?.provenance,sourceId=geometry.extras?.sourceId||source?.nodes[0]?.extras?.sourceId||(info?.sourceFile+':'+info?.pathId);
-  let live=null,state=null,lastWorlds=null;const framingCache=new Map();
+  const playback={live:null,state:null,lastWorlds:null},framingCache=new Map();
   const fail=(clipId,reason)=>diagnostics.push({clipId:clipId||null,reason});
   if(data) {
     try {
@@ -517,7 +517,8 @@ export function createSourceAnimation(geometry,data) {
   }
   if(Array.isArray(data?.unsupportedClips))for(const clip of data.unsupportedClips)fail(clip.sourceClipId||clip.id,(clip.name?clip.name+'：':'')+(clip.reason||'源片段尚不支持预览'));
   const clips=[...compiled.values()].map(clip=>({id:clip.id,name:clip.name||clip.id,duration:clip.duration,loop:clip.loop===true,sourceClipId:clip.sourceClipId||clip.id,limitations:Array.isArray(clip.limitations)?clip.limitations.slice():[],...(clip.previewPreparation?{previewPreparation:{...clip.previewPreparation}}:{})}));
-  function sample(clipId,time) {
+  function sample(clipId,time,evaluation=playback) {
+    let live=evaluation.live;
     const clip=compiled.get(clipId);
     if(!clip)throw Error('此动画没有已验证的可播放曲线');
     if(!Number.isFinite(time))throw Error('动画时间必须是有限数值');
@@ -528,7 +529,7 @@ export function createSourceAnimation(geometry,data) {
       let segment=clip.segments[0],index=0;
       for(let i=1;i<clip.segments.length;i++)if(time>=clip.segments[i].start){segment=clip.segments[i];index=i;}else break;
       const child=compiled.get(segment.clipId),local=clamp((time-segment.start)*segment.speed+segment.sourceStart,0,child.duration);
-      const result=sample(segment.clipId,local);state={clipId,time,duration:clip.duration};
+      const result=sample(segment.clipId,local,evaluation);evaluation.state={clipId,time,duration:clip.duration};
       result.animationEvaluation={...result.animationEvaluation,classification:'derived_source_state_flow',flowId:clipId,segmentIndex:index,segmentClipId:segment.clipId,segmentLocalTime:local,crossBoundaryInterpolation:false,eventsExecuted:false};
       return result;
     }
@@ -581,48 +582,62 @@ export function createSourceAnimation(geometry,data) {
       includeVisibleTriangleBounds(p,min,max);
       p.center=centroid.map(value=>value/p.indices.length);
     }
-    lastWorlds=new Map([...source.nodeWorlds.keys()].map(index=>[index,world(index)]));
-    state={clipId,time,duration:clip.duration};live.animationEvaluation={mode:data?.evaluation==='source_constraint_baked'?'source_constraint_baked':clip.tracks.some(t=>t.interpolation==='UNITY_CANONICAL')?'exact-canonical-source-scalars':'source-keyframes',derivedTrackCount:clip.tracks.filter(t=>t.reconstruction==='source_constraint_math').length,offlineSourceConstraintsApplied:data?.evaluation==='source_constraint_baked',trackCount:clip.tracks.length,affectedPrimitives:clip.affected.size,skinnedPrimitives:source.restPrimitives.filter(p=>p.skinData).length,runtimeIK:false,eventsExecuted:false};live.posedBounds=min.every(Number.isFinite)?{min,max}:null;
+    evaluation.lastWorlds=new Map([...source.nodeWorlds.keys()].map(index=>[index,world(index)]));
+    evaluation.state={clipId,time,duration:clip.duration};evaluation.live=live;live.animationEvaluation={mode:data?.evaluation==='source_constraint_baked'?'source_constraint_baked':clip.tracks.some(t=>t.interpolation==='UNITY_CANONICAL')?'exact-canonical-source-scalars':'source-keyframes',derivedTrackCount:clip.tracks.filter(t=>t.reconstruction==='source_constraint_math').length,offlineSourceConstraintsApplied:data?.evaluation==='source_constraint_baked',trackCount:clip.tracks.length,affectedPrimitives:clip.affected.size,skinnedPrimitives:source.restPrimitives.filter(p=>p.skinData).length,runtimeIK:false,eventsExecuted:false};live.posedBounds=min.every(Number.isFinite)?{min,max}:null;
     return live;
   }
   function getFraming(clipId=clips[0]?.id) {
     const cached=framingCache.get(clipId);if(cached)return {...cached,center:cached.center.slice()};
-    const selected=compiled.get(clipId);if(!selected)return {center:[0,0,0],scale:1,sampleCount:0,clipId:null};
-    // Offline source-sweep cache avoids hundreds of skinning frames on modal open.
-    // Bound to the same model and canonical clip; sample three poses before use.
+    const selected=compiled.get(clipId);
+    const fallback={center:[0,0,0],scale:1,sampleCount:0,clipId:selected?clipId:null,approximate:true,reason:'静态取景；未扫描完整动画，运动可能超出画面'};
+    if(!selected)return fallback;
+    // The verified sidecar is bound to this model and canonical clip. Reading it
+    // must not pose geometry or alter live playback merely to open a preview.
     const prepared=data?.precomputedFraming?.[clipId];
-    if(prepared&&prepared.modelSHA256===data.modelSHA256&&prepared.canonicalSHA256===selected.canonicalSHA256&&prepared.clipId===clipId&&Array.isArray(prepared.center)&&prepared.center.length===3&&prepared.center.every(Number.isFinite)&&Number.isFinite(prepared.scale)&&prepared.scale>0&&prepared.scale<=1&&Number.isSafeInteger(prepared.sampleCount)&&prepared.sampleCount>0&&prepared.bounds?.min?.length===3&&prepared.bounds?.max?.length===3&&[...prepared.bounds.min,...prepared.bounds.max].every(Number.isFinite)){
-      const previous=state?{...state}:null;let valid=true;
-      for(const time of [0,selected.duration/2,selected.duration]){const b=sample(clipId,time).posedBounds;if(b)for(let k=0;k<3;k++)if(b.min[k]<prepared.bounds.min[k]-1e-5||b.max[k]>prepared.bounds.max[k]+1e-5)valid=false;}
-      if(previous)sample(previous.clipId,previous.time);else state=null;
-      if(valid){const ready={...prepared,center:prepared.center.slice(),precomputed:true};framingCache.set(clipId,ready);return {...ready,center:ready.center.slice()};}
+    if(prepared&&typeof data.modelSHA256==='string'&&typeof selected.canonicalSHA256==='string'&&prepared.modelSHA256===data.modelSHA256&&prepared.canonicalSHA256===selected.canonicalSHA256&&prepared.clipId===clipId&&Array.isArray(prepared.center)&&prepared.center.length===3&&prepared.center.every(Number.isFinite)&&Number.isFinite(prepared.scale)&&prepared.scale>0&&prepared.scale<=1&&Number.isSafeInteger(prepared.sampleCount)&&prepared.sampleCount>0&&prepared.bounds?.min?.length===3&&prepared.bounds?.max?.length===3&&[...prepared.bounds.min,...prepared.bounds.max].every(Number.isFinite)&&prepared.bounds.min.every((value,i)=>value<=prepared.bounds.max[i])){
+      const ready={...prepared,center:prepared.center.slice(),precomputed:true};framingCache.set(clipId,ready);return {...ready,center:ready.center.slice()};
     }
-    const previous=state?{...state}:null,min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];let sampleCount=0,framing;
-
-    // A fixed full-clip frame avoids clipping thrown gift panels or zoom pumping.
-    // Include source key boundaries, their midpoints, and a dense uniform sweep.
-    for(const clip of [selected]) {
-      const times=new Set([0,clip.duration]);
-      if(clip.segments){for(const segment of clip.segments){times.add(segment.start);times.add(segment.end);times.add(Math.max(segment.start,segment.end-1e-7));for(const track of compiled.get(segment.clipId).tracks)for(const time of track.times){const t=segment.start+(time-segment.sourceStart)/segment.speed;if(t>=segment.start&&t<=segment.end)times.add(t);}}}else for(const track of clip.tracks)for(const time of track.times)times.add(time);
-      const steps=Math.min(1200,Math.max(1,Math.ceil(clip.duration*120)));
-      for(let i=0;i<=steps;i++)times.add(clip.duration*i/steps);
-      const sorted=[...times].sort((a,b)=>a-b);
-      for(let i=1;i<sorted.length;i++)times.add((sorted[i-1]+sorted[i])/2);
-      for(const time of times) {
-        const bounds=sample(clip.id,time).posedBounds;sampleCount++;
-        if(bounds)for(let axis=0;axis<3;axis++){min[axis]=Math.min(min[axis],bounds.min[axis]);max[axis]=Math.max(max[axis],bounds.max[axis]);}
-      }
-    }
-    if(previous)sample(previous.clipId,previous.time);else state=null;
-    if(!min.every(Number.isFinite))framing={center:[0,0,0],scale:1,sampleCount};
-    else {
-      const center=min.map((value,i)=>(value+max[i])/2),radius=Math.hypot(...min.map((value,i)=>(max[i]-value)/2));
-      framing={center,scale:Math.min(1,1.25/Math.max(radius*1.04,1e-5)),sampleCount,bounds:{min,max}};
-    }
-    framing.clipId=clipId;framingCache.set(clipId,framing);
-    return {...framing,center:framing.center.slice()};
+    return fallback;
   }
-  return {clips,diagnostics,sample,getFraming,getNodeWorldMatrices(){return lastWorlds?new Map([...lastWorlds].map(([k,v])=>[k,v.slice()])):null;},reset(){state=null;return geometry;},getState(){return state?{...state}:null;}};
+  function framePose(clipId,bounds) {
+    const candidate=getFraming(clipId);
+    if(!bounds)return candidate;
+    // Playback already computed these bounds. Validate a sidecar against the
+    // actual pose without another geometry pass or trusting metadata alone.
+    const contains=candidate.bounds&&bounds.min.every((value,i)=>value>=candidate.bounds.min[i]-1e-5&&bounds.max[i]<=candidate.bounds.max[i]+1e-5);
+    const radius=Math.hypot(...bounds.min.map((value,i)=>Math.max(Math.abs(value-candidate.center[i]),Math.abs(bounds.max[i]-candidate.center[i]))));
+    if(contains&&radius*candidate.scale<=1.25+1e-5)return candidate;
+    const center=bounds.min.map((value,i)=>(value+bounds.max[i])/2),poseRadius=Math.hypot(...bounds.min.map((value,i)=>(bounds.max[i]-value)/2));
+    const framing={center,scale:Math.min(1,1.25/Math.max(poseRadius*1.04,1e-5)),bounds:{min:bounds.min.slice(),max:bounds.max.slice()},clipId,sampleCount:0,approximate:true,reason:'起始姿态取景；未扫描完整动画，后续运动可能超出画面'};
+    framingCache.set(clipId,framing);return {...framing,center:framing.center.slice()};
+  }
+  async function prepareFraming(clipId=clips[0]?.id,{signal}={}) {
+    const initial=getFraming(clipId),clip=compiled.get(clipId);
+    if(signal?.aborted)throw cancelledError();
+    if(!clip||initial.precomputed||initial.sampleCount)return initial;
+    // Bound each indivisible pose as well as total work. Large models retain the
+    // selected pose frame; building a candidate list from every key is avoided.
+    const maxVertices=12000,maxTriangles=24000,maxNodes=256,maxTracks=128,maxSamples=17;
+    if(geometry.vertices>maxVertices||geometry.triangles>maxTriangles||source.nodes.length>maxNodes||clip.tracks.length>maxTracks||clip.segments?.length>maxTracks||clip.segments?.some(segment=>compiled.get(segment.clipId).tracks.length>maxTracks))return initial;
+    const evaluation={live:null,state:null,lastWorlds:null};
+    // Fixed work and sample times keep A/B framing identical regardless of timing.
+    // Include the selected pose as well as the complete bounded sweep.
+    const min=initial.bounds?.min.slice()||geometry.bounds.min.map((value,i)=>(value-geometry.bounds.center[i])*geometry.bounds.scale);
+    const max=initial.bounds?.max.slice()||geometry.bounds.max.map((value,i)=>(value-geometry.bounds.center[i])*geometry.bounds.scale);
+    let sampleCount=0;
+    for(let step=0;step<maxSamples;step++) {
+      await new Promise(resolve=>setTimeout(resolve,0));
+      if(signal?.aborted)throw cancelledError();
+      const bounds=sample(clipId,clip.duration*step/(maxSamples-1),evaluation).posedBounds;sampleCount++;
+      if(bounds)for(let axis=0;axis<3;axis++){min[axis]=Math.min(min[axis],bounds.min[axis]);max[axis]=Math.max(max[axis],bounds.max[axis]);}
+    }
+    if(signal?.aborted)throw cancelledError();
+    if(!min.every(Number.isFinite))return initial;
+    const center=min.map((value,i)=>(value+max[i])/2),radius=Math.hypot(...min.map((value,i)=>(max[i]-value)/2));
+    const framing={center,scale:Math.min(1,1.25/Math.max(radius*1.04,1e-5)),sampleCount,bounds:{min,max},clipId,approximate:true,reason:'有限采样的固定取景；未覆盖的运动可能超出画面'};
+    framingCache.set(clipId,framing);return {...framing,center:framing.center.slice()};
+  }
+  return {clips,diagnostics,sample,getFraming,framePose,prepareFraming,getNodeWorldMatrices(){return playback.lastWorlds?new Map([...playback.lastWorlds].map(([k,v])=>[k,v.slice()])):null;},reset(){playback.state=null;return geometry;},getState(){return playback.state?{...playback.state}:null;}};
 }
 
 // A compact linear-light material shader, not a Unity/URP or full PBR implementation.
@@ -808,6 +823,38 @@ async function decodeImage(image,signal) {
   });
 }
 
+// Plan only maps used by rendered primitives. Shader wrap is per binding for NPOT
+// images; it does not require another GPU allocation with the same sampler.
+export function planTextureUploads(geometry,images=geometry.images) {
+  const uploads=[],maps=new Map(),unique=new Map();let bytes=4;
+  const required=new Set();
+  for(const primitive of geometry.primitives)for(const info of [primitive.material.baseColorTexture,primitive.material.emissiveTexture,primitive.material.metallicRoughnessTexture])if(info?.texCoord===0)required.add(info.index);
+  const wrapMode=value=>value===33071?0:value===33648?2:1;
+  for(const index of required) {
+    const descriptor=geometry.textures[index],image=images[descriptor?.source];
+    if(!image)throw Error('材质贴图引用无效');
+    let {width,height}=image;
+    budget(width,PREVIEW_LIMITS.imageDimension,'image width');budget(height,PREVIEW_LIMITS.imageDimension,'image height');
+    if(!width||!height)throw Error('材质贴图尺寸无效');
+    const sampler=descriptor.sampler,pot=(width&(width-1))===0&&(height&(height-1))===0;
+    let min=[9728,9729,9984,9985,9986,9987].includes(sampler.minFilter)?sampler.minFilter:9987;
+    if(!pot)min=min===9728?9728:9729;
+    const mag=sampler.magFilter===9728?9728:9729;
+    const wrap=value=>pot?([33071,33648,10497].includes(value)?value:10497):33071;
+    const wrapS=wrap(sampler.wrapS),wrapT=wrap(sampler.wrapT),mipmaps=pot&&min>=9984;
+    const key=[descriptor.source,min,mag,wrapS,wrapT].join(':');
+    let upload=unique.get(key);
+    if(!upload){
+      let size=width*height*4;
+      while(mipmaps&&(width>1||height>1)){width=Math.max(1,width>>1);height=Math.max(1,height>>1);size+=width*height*4;}
+      bytes+=size;budget(bytes,PREVIEW_LIMITS.textureBytes,'aggregate texture bytes');
+      upload={source:descriptor.source,min,mag,wrapS,wrapT,mipmaps};unique.set(key,upload);uploads.push(upload);
+    }
+    maps.set(index,{upload,wrap:pot?[0,0]:[wrapMode(sampler.wrapS),wrapMode(sampler.wrapT)]});
+  }
+  return {uploads,maps,bytes};
+}
+
 export async function createViewer(container,url,options={}) {
   activeViewers.get(container)?.dispose();
   const canvas=options._canvas||document.createElement('canvas');
@@ -815,6 +862,7 @@ export async function createViewer(container,url,options={}) {
   Object.assign(canvas.style,{display:'block',width:'100%',height:'100%',touchAction:'none'});
   container.replaceChildren(canvas);
   const abort=new AbortController(),cleanups=[],decodedImages=[];
+  let framingJob=null;
   let disposed=false,contextLost=false,ready=false,geometry,animation=null,animationFrame={center:[0,0,0],scale:1},gpu=null,resize=null,frame=0,drag=null,isWire=false;
   let camera=sanitizeCamera(options.camera),profile=prepareProfile(options.profile),materialRules=prepareMaterialRules(options.materialRules);
   const gl=canvas.getContext('webgl',{antialias:true,alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:!!options._sharedResources});
@@ -835,7 +883,7 @@ export async function createViewer(container,url,options={}) {
     if(options._sharedResources?.program!==gpu.program)gl.deleteProgram(gpu.program);gpu=null;
   }
   function dispose() {
-    if(disposed)return;disposed=true;abort.abort();cancelAnimationFrame(frame);resize?.disconnect();
+    if(disposed)return;disposed=true;abort.abort();framingJob?.abort();cancelAnimationFrame(frame);resize?.disconnect();
     for(const cleanup of cleanups)cleanup();releaseGPU();
     for(const img of decodedImages)img?.close?.();decodedImages.length=0;
     if(activeViewers.get(container)===api){activeViewers.delete(container);container.querySelector('[data-viewer-status]')?.remove();}
@@ -861,6 +909,16 @@ export async function createViewer(container,url,options={}) {
     requestDraw();
     if(alive())options.onAnimationChange?.(animation?.getState()||null);
   }
+  function selectFraming(clipId,bounds) {
+    framingJob?.abort();framingJob=null;
+    animationFrame=bounds?animation.framePose(clipId,bounds):animation.getFraming(clipId);
+    if(clipId===null||animationFrame.precomputed||animationFrame.sampleCount)return;
+    const job=new AbortController();framingJob=job;
+    animation.prepareFraming(clipId,{signal:job.signal}).then(result=>{
+      if(!alive()||job.signal.aborted||framingJob!==job)return;
+      if(result.sampleCount)animationFrame=result;framingJob=null;requestDraw();
+    }).catch(error=>{if(error.name!=='AbortError'&&!job.signal.aborted&&framingJob===job&&alive()){framingJob=null;showStatus(error.message);options.onError?.(error);}});
+  }
   function notifyCamera(){if(alive()&&typeof options.onCameraChange==='function')options.onCameraChange({...camera});}
   const api={reset(){if(!disposed){camera={...defaultCamera};requestDraw();notifyCamera();}},wireframe(value){isWire=!!value;requestDraw();},
     setProfile(value){profile=prepareProfile(value);requestDraw();},
@@ -873,13 +931,17 @@ export async function createViewer(container,url,options={}) {
       // Only the app owns playback time. Both views receive this same absolute seek.
       try{
         // Reframe once on clip selection, never on the shared clock's frame ticks.
-        if(clipId!==null&&animationFrame.clipId!==clipId)animationFrame=animation.getFraming(clipId);
-        applyAnimationGeometry(clipId===null?animation.reset():animation.sample(clipId,time));
+        const changed=animation.getState()?.clipId!==clipId;
+        const next=clipId===null?animation.reset():animation.sample(clipId,time);
+        if(changed)selectFraming(clipId,next.posedBounds);
+        else if(animationFrame.precomputed&&!animation.framePose(clipId,next.posedBounds).precomputed)selectFraming(clipId,next.posedBounds);
+        else if(framingJob&&!animationFrame.sampleCount)animationFrame=animation.framePose(clipId,next.posedBounds);
+        applyAnimationGeometry(next);
       }
       catch(error){applyAnimationGeometry(animation.reset());throw error;}
       return animation.getState();
     },
-    resetAnimation(){if(alive()&&animation)applyAnimationGeometry(animation.reset());},
+    resetAnimation(){if(alive()&&animation){selectFraming(null);applyAnimationGeometry(animation.reset());}},
     getAnimationDiagnostics(){return animation?.diagnostics.map(item=>({...item}))||[];},
     get animationWarnings(){return animation?.diagnostics.map(item=>({...item}))||[];},
     // Programmatic camera updates are silent, avoiding feedback loops between two viewers.
@@ -918,25 +980,25 @@ export async function createViewer(container,url,options={}) {
       for(const key of ['uMVP','uModelView','uBaseMap','uEmissiveMap','uMRMap','uBaseUV','uEmissiveUV','uMRUV','uBaseWrap','uEmissiveWrap','uMRWrap','uBaseColor','uEmissive','uLightDirection','uAmbientColor','uKeyColor','uShadowColor','uBaseTint','uAmbient','uKey','uBands','uLightThreshold','uSaturation','uContrast','uAlphaMode','uAlphaCutoff','uMetallic','uRoughness','uMode','uUnlit','uFlatCanopy','uCanopyColor','uWire'])gpu.loc[key]=gl.getUniformLocation(program,key);
       if(shared){shared.program=program;shared.loc=gpu.loc;}
     }
-    function uploadTexture(img,sampler={}) {
-      if(img&&(img.width>gl.getParameter(gl.MAX_TEXTURE_SIZE)||img.height>gl.getParameter(gl.MAX_TEXTURE_SIZE)))throw Error('源贴图超过此设备支持的最大尺寸');
-      const texture=gl.createTexture();gpu.textures.push(texture);gl.bindTexture(gl.TEXTURE_2D,texture);
+    const plan=planTextureUploads(geometry,decodedImages),maxSize=gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    for(const upload of plan.uploads){const img=decodedImages[upload.source];if(img.width>maxSize||img.height>maxSize)throw Error('源贴图超过此设备支持的最大尺寸');}
+    function uploadTexture(img,sampler) {
+      const texture=gl.createTexture();if(!texture)throw Error('无法分配预览贴图');
+      gpu.textures.push(texture);gl.bindTexture(gl.TEXTURE_2D,texture);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,false);gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL,gl.NONE);
       if(img)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
       else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,255,255,255]));
-      const pot=!img||((img.width&(img.width-1))===0&&(img.height&(img.height-1))===0),wrap=[gl.CLAMP_TO_EDGE,gl.MIRRORED_REPEAT,gl.REPEAT];
-      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,pot&&wrap.includes(sampler.wrapS)?sampler.wrapS:pot?gl.REPEAT:gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,pot&&wrap.includes(sampler.wrapT)?sampler.wrapT:pot?gl.REPEAT:gl.CLAMP_TO_EDGE);
-      const min=[gl.NEAREST,gl.LINEAR,gl.NEAREST_MIPMAP_NEAREST,gl.LINEAR_MIPMAP_NEAREST,gl.NEAREST_MIPMAP_LINEAR,gl.LINEAR_MIPMAP_LINEAR].includes(sampler.minFilter)?sampler.minFilter:gl.LINEAR_MIPMAP_LINEAR;
-      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,pot?min:min===gl.NEAREST?gl.NEAREST:gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,sampler.magFilter===gl.NEAREST?gl.NEAREST:gl.LINEAR);
-      if(pot)gl.generateMipmap(gl.TEXTURE_2D);
-      // WebGL 1 cannot repeat NPOT textures in hardware. Preserve source tiling in GLSL.
-      const wrapMode=v=>v===gl.CLAMP_TO_EDGE?0:v===gl.MIRRORED_REPEAT?2:1;
-      return {texture,wrap:pot?[0,0]:[wrapMode(sampler.wrapS),wrapMode(sampler.wrapT)]};
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,sampler.wrapS);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,sampler.wrapT);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,sampler.min);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,sampler.mag);
+      if(sampler.mipmaps)gl.generateMipmap(gl.TEXTURE_2D);
+      if(gl.getError()!==gl.NO_ERROR)throw Error('预览贴图上传失败');
+      return texture;
     }
-    gpu.white=uploadTexture(null);
-    gpu.maps=geometry.textures.map(texture=>uploadTexture(decodedImages[texture.source],texture.sampler));
+    gpu.white={texture:uploadTexture(null,{wrapS:gl.CLAMP_TO_EDGE,wrapT:gl.CLAMP_TO_EDGE,min:gl.LINEAR,mag:gl.LINEAR}),wrap:[0,0]};
+    const uploaded=new Map(plan.uploads.map(upload=>[upload,uploadTexture(decodedImages[upload.source],upload)]));
+    gpu.maps=[];for(const [index,map] of plan.maps)gpu.maps[index]={texture:uploaded.get(map.upload),wrap:map.wrap};
     for(const primitive of geometry.primitives) {
       const packed=new Float32Array(primitive.indices.length*12);
       for(let j=0;j<primitive.indices.length;j++) {
@@ -992,7 +1054,7 @@ export async function createViewer(container,url,options={}) {
     gl.depthMask(true);gl.disable(gl.BLEND);
   }
   listen(canvas,'webglcontextlost',event=>{event.preventDefault();contextLost=true;cancelAnimationFrame(frame);frame=0;gpu=null;if(options._sharedResources){options._sharedResources.program=null;options._sharedResources.loc=null;}showStatus('三维上下文暂时中断，等待浏览器恢复…');});
-  listen(canvas,'webglcontextrestored',()=>{if(!alive())return;contextLost=false;if(!ready)return;try{initializeGPU();showStatus('');requestDraw();}catch(error){showStatus(error.message);options.onError?.(error);}});
+  listen(canvas,'webglcontextrestored',()=>{if(!alive())return;contextLost=false;if(!ready)return;try{initializeGPU();showStatus('');requestDraw();}catch(error){releaseGPU();showStatus(error.message);options.onError?.(error);}});
   if(!options._sharedResources){
   listen(canvas,'pointerdown',event=>{if(event.button!==0)return;drag={id:event.pointerId,x:event.clientX,y:event.clientY};canvas.setPointerCapture(event.pointerId);});
   listen(canvas,'pointermove',event=>{if(!drag||drag.id!==event.pointerId)return;camera=sanitizeCamera({yaw:camera.yaw+(event.clientX-drag.x)*0.009,pitch:camera.pitch+(event.clientY-drag.y)*0.009},camera);drag.x=event.clientX;drag.y=event.clientY;requestDraw();notifyCamera();});
@@ -1003,9 +1065,9 @@ export async function createViewer(container,url,options={}) {
   try {
     geometry=await loadGeometry(url,{signal:abort.signal});
     // Thumbnail jobs can never bind or sample motion, even if options are reused.
-    if(!options._sharedResources){animation=createSourceAnimation(geometry,options.animationData);if(animation.clips.length)animationFrame=animation.getFraming();}
+    if(!options._sharedResources)animation=createSourceAnimation(geometry,options.animationData);
     if(!alive()){dispose();return api;}
-    const required=new Set();for(const material of geometry.materials)for(const info of [material.baseColorTexture,material.emissiveTexture,material.metallicRoughnessTexture])if(info&&info.texCoord===0){const source=geometry.textures[info.index]?.source;if(source!==undefined)required.add(source);else throw Error('材质贴图引用无效');}
+    const required=new Set(planTextureUploads(geometry).uploads.map(upload=>upload.source));
     // Sequential decoding bounds transient image memory and checks cancellation between images.
     for(const index of required) {
       const source=geometry.images[index];if(!source)throw Error('材质内嵌图像缺失');
