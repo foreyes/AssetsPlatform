@@ -10,7 +10,7 @@ import {fileURLToPath} from 'node:url';
 
 register('./publication-fixture-loader.mjs', import.meta.url);
 const {createIncrementalStorage}=await import('./storage.mjs');
-const {validateManifest,hash,encode}=await import('./manifest.mjs');
+const {validateManifest,validateCatalogs,hash,encode}=await import('./manifest.mjs');
 const {applyIncremental}=await import('./transport.mjs');
 const {projectDirectory}=await import('../lib/incremental-project-directory.mjs');
 const {resolveProjectDirectory}=await import('../review-frontend/shared/project-loader.mjs');
@@ -147,4 +147,54 @@ for(const [name,mutate]of[
  ['JSON count cap',files=>{while(files.length<9)files.push({...files[0],id:'extra'+files.length,path:'assets/extra'+files.length+'.json'})}]
 ])test('exporter structural preflight rejects '+name+' without output',async t=>{
  const {result,out}=await runExporter(t,mutate);assert.equal(result.status,2,result.stderr);assert.match(result.stderr,/Invalid hosted manifest:/);assert.equal(fs.existsSync(out),false);
+});
+
+test('frontend-invalid metadata cannot receive a publication receipt or active pointer',async t=>{
+ const e=environment(t),b=await bundle('synthetic','   ');await prepare(e,b);await assert.rejects(e.call('finalize',b.args),/ingest-catalog/);assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_versions').get().n,0);assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_active').get().n,0);
+});
+
+
+async function refreshBundle(b){
+ b.blocks={};for(const file of b.manifest.files){const bytes=encode(b.docs.get(file.path));file.sha256=await hash(bytes);file.bytes=bytes.length;file.revision=file.sha256;file.blocks=[{sha256:file.sha256,bytes:file.bytes}];b.blocks[file.sha256]=Buffer.from(bytes).toString('base64')}
+ b.v=await validateManifest(b.manifest);b.args.version=b.v.version;return b;
+}
+for(const [name,mutate] of [
+ ['synthetic-origin profile',b=>b.docs.get('assets/objects-catalog.json').profilesUrl='https://ingest.invalid/assets/render-profiles.json'],
+ ['query profile unsupported by frontend',b=>b.docs.get('assets/objects-catalog.json').profilesUrl='assets/render-profiles.json?revision=1'],
+ ['host-bearing profile',b=>b.docs.get('assets/objects-catalog.json').profilesUrl='//ingest.invalid/assets/render-profiles.json'],
+ ['nested foreign shards',b=>b.docs.get('assets/catalog.json').assets[0].extra={assetShards:['https://foreign.invalid/shard.json']}],
+ ['nested null shards',b=>b.docs.get('assets/canopy-rules.json').extra={assetShards:null}]
+])test('apply rejects '+name+' before publication',async t=>{
+ const e=environment(t),b=await bundle();mutate(b);await refreshBundle(b);
+ await assert.rejects(applyIncremental({bundle:b,call:(name,args)=>e.call(name.slice('entity_assets_'.length),args)}),/ingest-(reference|catalog|private-metadata)/);
+ assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_versions').get().n,0);assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_active').get().n,0);
+});
+for(const profilesUrl of ['/assets/render-profiles.json','assets/render-profiles.json'])test('valid logical profile path publishes and loads in actual frontend '+profilesUrl,async t=>{
+ const e=environment(t),b=await bundle();b.docs.get('assets/objects-catalog.json').profilesUrl=profilesUrl;await refreshBundle(b);assert.equal((await applyIncremental({bundle:b,call:(name,args)=>e.call(name.slice('entity_assets_'.length),args)})).ready,true);
+ const {loadData}=await import('../review-frontend/adapters/indexed-data.mjs'),{validateCatalogData}=await import('../review-frontend/shared/project-schema.mjs');
+ const root=`/api/review-assets/HamstersAway/synthetic/${b.v.version}/`;
+ const data=await loadData({config:{projectId:'HamstersAway',datasetId:'synthetic',assetRoot:root,origin:'https://actual-viewer.invalid',dataKind:'indexed'},readJSON:async url=>{const target=new URL(url);assert.equal(target.origin,'https://actual-viewer.invalid');return structuredClone(b.docs.get(target.pathname.slice(root.length)))}});
+ assert.equal(validateCatalogData(data).evidence.profiles.length,0);
+});
+
+
+for(const [label,mutate] of [
+ ['blank resource ID',b=>b.docs.get('assets/catalog.json').assets[0].id='  '],
+ ['reserved object ID',b=>b.docs.get('assets/objects-catalog.json').objects[0].id='constructor'],
+ ['blank object name',b=>b.docs.get('assets/objects-catalog.json').objects[0].name='  '],
+ ['wrong actual profiles JSON',b=>b.docs.get('assets/objects-catalog.json').profilesUrl='assets/canopy-rules.json']
+])test(label+' rejects before active pointer or receipt',async t=>{
+ const e=environment(t),b=await bundle();mutate(b);await refreshBundle(b);await prepare(e,b);
+ await assert.rejects(e.call('finalize',b.args),/ingest-(catalog|profiles)/);
+ assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_versions').get().n,0);
+ assert.equal(e.db.prepare('SELECT COUNT(*) AS n FROM ingest_active').get().n,0);
+});
+test('profile reference must select JSON even when non-JSON file is registered',async()=>{
+ const b=await bundle();b.v.manifest.files.push({path:'assets/preview.png'});
+ b.docs.get('assets/objects-catalog.json').profilesUrl='assets/preview.png';
+ assert.throws(()=>validateCatalogs(b.v,b.docs),/ingest-profiles/);
+});
+test('null profile reference retains the indexed adapter fallback',async t=>{
+ const e=environment(t),b=await bundle();b.docs.get('assets/objects-catalog.json').profilesUrl=null;await refreshBundle(b);
+ assert.equal((await applyIncremental({bundle:b,call:(name,args)=>e.call(name.slice('entity_assets_'.length),args)})).ready,true);
 });

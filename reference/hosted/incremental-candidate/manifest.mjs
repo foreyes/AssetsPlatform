@@ -1,3 +1,4 @@
+import {validateCatalogData} from '../review-frontend/shared/project-schema.mjs';
 import {createResourceResolver} from '../asset-source/shared/resource-url.mjs';
 import {validateSelfContainedGLB,enforceThumbnailBudget,retireModel} from '../asset-source/model-resource.js';
 import {GLTFLoader} from '../asset-source/vendor/loaders/GLTFLoader.js';
@@ -6,7 +7,53 @@ import {LIMITS,fail,format,checkJSONText} from './manifest-contract.mjs';
 export {PROJECTS,LIMITS,fail,exact,canonical,hash,encode,scope,path,format,mime,validateManifest} from './manifest-contract.mjs';
 export async function validateContent(file,bytes){if(format(file.path)==='glb'){try{const b=bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);const j=validateSelfContainedGLB(b);checkJSONText(new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array(b,20,new DataView(b).getUint32(12,true))));if(j.asset?.version!=='2.0'||!Array.isArray(j.scenes)||!j.scenes.length||!Array.isArray(j.nodes)||!j.nodes.length||!Array.isArray(j.meshes)||!j.meshes.length||!j.nodes.some(n=>Number.isSafeInteger(n.mesh)&&j.meshes[n.mesh]?.primitives?.length))fail('model');if((j.animations||[]).length)fail('animation');enforceThumbnailBudget(b,j);await verifyStaticGLB(b,j)}catch(e){if(['ingest-animation','ingest-private-metadata'].includes(e.message))throw e;fail('model')}}else if(format(file.path)==='png'){await validatePNG(bytes)}else {try{checkJSONText(new TextDecoder('utf-8',{fatal:true}).decode(bytes))}catch(e){if(e.message==='ingest-private-metadata')throw e;fail('json')}}}
 export function rootURL(v){return `/api/review-assets/${v.manifest.projectId}/${v.manifest.datasetId}/${v.version}/`}
-export function validateCatalogs(v,documents){const get=p=>{if(!documents.has(p))fail('metadata-missing');return structuredClone(documents.get(p))};const catalog=get('assets/catalog.json'),objects=get('assets/objects-catalog.json');if(catalog.version!==1||!Array.isArray(catalog.assets)||!catalog.assets.length||catalog.assets.length>LIMITS.files||objects.version!==2||!Array.isArray(objects.objects)||!objects.objects.length||objects.objects.length>LIMITS.files||catalog.assetShards)fail('catalog');const files=new Map(v.manifest.files.map(f=>[f.path,f])),root=rootURL(v),resolver=createResourceResolver({projectId:v.manifest.projectId,datasetId:v.manifest.datasetId,assetRoot:root,origin:'https://ingest.invalid',dataKind:'indexed'});const ids=new Set();for(const list of [catalog.assets,objects.objects])for(const r of list){if(r?.modelAsset||r?.delivery||r?.transport||r?.resourceBaseUrl)fail('catalog');if(!r||typeof r.id!=='string'||ids.has(r.id)||typeof r.sourceId!=='string'||!r.sourceId||typeof r.name!=='string'||r.name.length>512)fail('catalog');ids.add(r.id)}const URL_KEYS=new Set(['modelUrl','imageUrl','previewUrl','thumbnailUrl','originalUrl','dataUrl','profilesUrl','metadataUrl']);function walk(o){if(!o||typeof o!=='object')return;for(const[k,value]of Object.entries(o)){if((k==='url'||/(?:Url|URL|Uri|URI)$/.test(k))&&typeof value==='string'){if(!URL_KEYS.has(k))fail('reference');let target;try{target=new URL(resolver.resolve(value))}catch{fail('reference')}const p=target.pathname.slice(root.length);if(!files.has(p)||target.hash)fail('dependency');if(k==='modelUrl'&&format(p)!=='glb')fail('format');if(['imageUrl','thumbnailUrl'].includes(k)&&format(p)!=='png')fail('format')}else if(value&&typeof value==='object')walk(value)}}for(const d of documents.values())walk(d);if(objects.objects.some(o=>o.playableClipIds||o.animationPlayable)||catalog.assets.some(o=>o.type==='animation'))fail('animation');const material=get('assets/canopy-rules.json');if(material.version!==1||!Array.isArray(material.flatCanopySourceMaterialIds))fail('catalog');const profiles=get('assets/render-profiles.json');if(profiles.schemaVersion!==1||!Array.isArray(profiles.profiles)||profiles.profiles.length)fail('profiles');return {catalog,objects,profiles,material}}
+export function validateCatalogs(v,documents){
+ const get=p=>{if(!documents.has(p))fail('metadata-missing');return structuredClone(documents.get(p))};
+ const catalog=get('assets/catalog.json'),objects=get('assets/objects-catalog.json');
+ try{validateCatalogData({catalog,objectCatalog:objects,materialRules:get('assets/canopy-rules.json')})}catch{fail('catalog')}
+ if(catalog.version!==1||!catalog.assets.length||catalog.assets.length>LIMITS.files||objects.version!==2||!Array.isArray(objects.objects)||!objects.objects.length||objects.objects.length>LIMITS.files||catalog.assetShards!==undefined)fail('catalog');
+ const files=new Map(v.manifest.files.map(f=>[f.path,f])),root=rootURL(v);
+ const resolver=createResourceResolver({projectId:v.manifest.projectId,datasetId:v.manifest.datasetId,assetRoot:root,origin:'https://ingest.invalid',dataKind:'indexed'});
+ for(const list of [catalog.assets,objects.objects])for(const r of list){
+  if(r.modelAsset||r.delivery||r.transport||r.resourceBaseUrl)fail('catalog');
+  if(typeof r.sourceId!=='string'||!r.sourceId||r.name.length>512)fail('catalog');
+ }
+ const URL_KEYS=new Set(['modelUrl','imageUrl','previewUrl','thumbnailUrl','originalUrl','dataUrl','profilesUrl','metadataUrl']);
+ function declaredPath(value){
+  if(/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)||value.startsWith('//'))fail('reference');
+  let target;try{target=new URL(resolver.resolve(value))}catch{fail('reference')}
+  const p=target.pathname.slice(root.length);
+  if(!files.has(p)||target.hash)fail('dependency');
+  return p;
+ }
+ function walk(o){
+  if(!o||typeof o!=='object')return;
+  for(const[k,value]of Object.entries(o)){
+   if(k==='assetShards'&&value!==undefined)fail('catalog');
+   if((k==='url'||/(?:Url|URL|Uri|URI)$/.test(k))&&typeof value==='string'){
+    if(!URL_KEYS.has(k))fail('reference');
+    const p=declaredPath(value);
+    if(k==='modelUrl'&&format(p)!=='glb')fail('format');
+    if(['imageUrl','thumbnailUrl'].includes(k)&&format(p)!=='png')fail('format');
+   }else if(value&&typeof value==='object')walk(value);
+  }
+ }
+ for(const d of documents.values())walk(d);
+ if(objects.objects.some(o=>o.playableClipIds||o.animationPlayable)||catalog.assets.some(o=>o.type==='animation'))fail('animation');
+ const material=get('assets/canopy-rules.json');
+ if(material.version!==1||!Array.isArray(material.flatCanopySourceMaterialIds))fail('catalog');
+ const validateProfiles=p=>{if(!p||p.schemaVersion!==1||!Array.isArray(p.profiles)||p.profiles.length)fail('profiles');return p};
+ const profiles=validateProfiles(get('assets/render-profiles.json'));
+ // Match the indexed adapter's null/omitted fallback, while requiring every
+ // explicit profile URL to name declared JSON with the static empty schema.
+ if(objects.profilesUrl!==undefined&&objects.profilesUrl!==null){
+  if(typeof objects.profilesUrl!=='string'||!objects.profilesUrl.trim())fail('profiles');
+  const p=declaredPath(objects.profilesUrl);
+  if(format(p)!=='json')fail('profiles');
+  validateProfiles(get(p));
+ }
+ return {catalog,objects,profiles,material};
+}
 
 const crcTable=Uint32Array.from({length:256},(_,n)=>{for(let i=0;i<8;i++)n=n&1?0xedb88320^(n>>>1):n>>>1;return n>>>0});
 function crc(bytes){let n=0xffffffff;for(const b of bytes)n=crcTable[(n^b)&255]^(n>>>8);return(n^0xffffffff)>>>0}
